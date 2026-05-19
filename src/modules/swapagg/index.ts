@@ -1,10 +1,10 @@
 /**
  * Swap Aggregator Module (controller)
  * -----------------------------------
- * Exposes `/swapagg/*` endpoints that wrap KyberSwap's two-step
- * route + build flow into a single server-side call. Same privacy and
- * rate-limit posture as the rpc/prices modules: open CORS, salted-hash
- * client identity, no request logging.
+ * Exposes `/swapagg/*` endpoints that fan out to KyberSwap, 0x, and
+ * Uniswap via the umbrella SDK and return a normalized routes envelope.
+ * Same privacy and rate-limit posture as the rpc/prices modules: open
+ * CORS, salted-hash client identity, no request logging.
  */
 
 import { Elysia, t } from "elysia";
@@ -40,33 +40,91 @@ if (!ZEROX_API_KEY) {
 }
 
 /**
- * Tighter limit than `/rpc` because each call here makes two upstream
- * requests to KyberSwap's aggregator. 10 per minute lets a typical user
- * iterate on their swap (re-quote on input change) without burning the
- * partner client-id quota.
+ * Tighter limit than `/rpc` because each call here fans out to three
+ * aggregator APIs in parallel. 10 per minute lets a typical user iterate
+ * on their swap (re-quote on input change) without burning the partner
+ * client-id quota.
  */
 const RATE_LIMIT_MAX = 10;
 const RATE_LIMIT_DURATION_MS = 60_000;
 
+// --- Input validation ------------------------------------------------------
+//
+// Every field is constrained as tightly as is meaningful. The aggregator
+// upstreams already reject malformed input, but we don't want garbage to
+// reach them at all: it consumes our rate-limit budget there, leaks
+// arbitrary strings into our `meta.request` echo (which the frontend may
+// render), and would land in `route.raw` if persisted later.
+//
+// The regexes below are intentionally strict (allowlist, anchored,
+// length-bounded). Anything that doesn't match returns 400 from Elysia
+// before the handler runs.
+
 /**
- * JSON body validator for `POST /swapagg/{chain}`. We use POST (not GET)
- * so wallet addresses and token amounts travel in the request body, where
- * they don't end up in access logs or leak via the Referer header. Body is
- * JSON, so numeric/boolean fields use plain `t.Number` / `t.Boolean`.
+ * EVM address: literal `0x` followed by exactly 40 hex chars. Accepts
+ * any case (lowercase, uppercase, EIP-55 mixed) — the SDKs handle
+ * normalization downstream. The zero address (`0x000…`) is intentionally
+ * accepted because it's the native-token sentinel.
  */
-const SwapAggBody = t.Object({
-  tokenIn: t.String({ minLength: 1 }),
-  tokenOut: t.String({ minLength: 1 }),
-  amountIn: t.String({ minLength: 1 }),
-  sender: t.String({ minLength: 1 }),
-  recipient: t.String({ minLength: 1 }),
-  slippageTolerance: t.Optional(t.Number({ minimum: 0, maximum: 2000 })),
-  deadline: t.Optional(t.Number({ minimum: 0 })),
-  origin: t.Optional(t.String()),
-  source: t.Optional(t.String()),
-  referral: t.Optional(t.String()),
-  enableGasEstimation: t.Optional(t.Boolean()),
-});
+const HEX_ADDRESS = "^0x[a-fA-F0-9]{40}$";
+
+/**
+ * Decimal integer string, 1 to 78 chars (max uint256 in decimal is 78
+ * digits ≈ 1.16e77). Rejects negatives, scientific notation, hex,
+ * leading-zero variants other than the literal `"0"`. We do NOT permit
+ * `"0"` either — selling zero is meaningless and only consumes upstream
+ * budget — but the regex itself doesn't forbid it; the aggregator returns
+ * a clean 4xx if you somehow get a zero through.
+ */
+const DECIMAL_AMOUNT = "^[0-9]{1,78}$";
+
+/**
+ * Free-form tag (KyberSwap `source` / `referral`, etc.). Allowlist of
+ * alphanumeric + a few safe separators. Length-capped to keep large
+ * blobs from being smuggled into our `meta.request` echo.
+ */
+const TAG = "^[A-Za-z0-9._:/\\-]{1,64}$";
+
+/**
+ * Largest Unix-epoch-seconds deadline we accept. `0xFFFFFFFF` is the
+ * uint32 ceiling (~year 2106), comfortably past any realistic swap
+ * deadline. Avoids `Number.MAX_SAFE_INTEGER` being passed through to
+ * aggregators and triggering downstream BigInt overflows.
+ */
+const MAX_DEADLINE = 0xFFFFFFFF;
+
+/**
+ * JSON body validator for `POST /swapagg/{chain}`. POST (not GET) so
+ * wallet addresses and amounts don't end up in access logs or the Referer
+ * header.
+ *
+ * Unknown fields are silently stripped by Elysia's body parser before the
+ * handler runs (verified empirically — Elysia drops keys not in the
+ * schema regardless of `additionalProperties`). This is functionally
+ * equivalent to rejection for our security model: extras cannot propagate
+ * to the service, the upstream APIs, or the echoed `meta.request`. The
+ * `additionalProperties: false` setting documents intent and would kick
+ * in if Elysia's strip behavior ever changes.
+ */
+const SwapAggBody = t.Object(
+  {
+    tokenIn: t.String({ pattern: HEX_ADDRESS }),
+    tokenOut: t.String({ pattern: HEX_ADDRESS }),
+    amountIn: t.String({ pattern: DECIMAL_AMOUNT }),
+    sender: t.String({ pattern: HEX_ADDRESS }),
+    recipient: t.String({ pattern: HEX_ADDRESS }),
+    // bps; integer required (fractional bps don't exist).
+    slippageTolerance: t.Optional(
+      t.Integer({ minimum: 0, maximum: 2000 })
+    ),
+    deadline: t.Optional(t.Integer({ minimum: 0, maximum: MAX_DEADLINE })),
+    origin: t.Optional(t.String({ pattern: HEX_ADDRESS })),
+    source: t.Optional(t.String({ pattern: TAG })),
+    referral: t.Optional(t.String({ pattern: TAG })),
+    enableGasEstimation: t.Optional(t.Boolean()),
+  },
+  { additionalProperties: false }
+);
 
 // --- Controller ------------------------------------------------------------
 
@@ -84,25 +142,57 @@ export const swapagg = new Elysia({ prefix: "/swapagg" })
       },
     })
   )
-  // POST /swapagg/ethereum — get the best route AND its calldata in one
-  // round-trip. Returns the shared `SwapAggResult` envelope:
-  //   { id, timestamp, routes: { kyberswap: { …slim view, raw } }, meta, status }
-  // Each entry in `routes` holds the fields the frontend needs to broadcast
-  // (`routerAddress`, `data`, `transactionValue`, …) and a `raw` field with
-  // the untouched upstream payload, kept for future DB persistence.
+  // POST /swapagg/ethereum — get a best-effort route across all three
+  // aggregators in one round-trip. Returns the shared `SwapAggResult`
+  // envelope:
+  //   { id, timestamp, routes: { kyberswap?, zerox?, uniswap? }, meta, status }
   //
-  // POST (not GET) so wallet addresses and amounts stay out of access logs
-  // and Referer headers. Quotes are time-sensitive (gas/price/slippage),
-  // so the response is marked uncacheable as well.
+  // POST (not GET) so wallet addresses and amounts stay out of access
+  // logs and Referer headers. Quotes are time-sensitive (gas/price/
+  // slippage), so the response is marked uncacheable as well.
   .post(
     "/ethereum",
     async ({ body, set }) => {
       set.headers["cache-control"] = "no-store";
+
+      // Defensive re-construction: even though `SwapAggBody` validates
+      // shape, we destructure to the exact request fields the service
+      // accepts. This prevents any future schema laxity from accidentally
+      // forwarding unexpected keys to the umbrella SDK / aggregators.
+      const {
+        tokenIn,
+        tokenOut,
+        amountIn,
+        sender,
+        recipient,
+        slippageTolerance,
+        deadline,
+        origin,
+        source,
+        referral,
+        enableGasEstimation,
+      } = body;
+
       try {
-        return await SwapAggService.getSwap("ethereum", body);
+        return await SwapAggService.getSwap("ethereum", {
+          tokenIn,
+          tokenOut,
+          amountIn,
+          sender,
+          recipient,
+          slippageTolerance,
+          deadline,
+          origin,
+          source,
+          referral,
+          enableGasEstimation,
+        });
       } catch (err) {
-        // Translate KyberSwap's documented error codes into appropriate
-        // HTTP statuses so the frontend can branch on them.
+        // The umbrella SDK swallows per-aggregator failures inside
+        // Promise.allSettled, so this branch only fires for programmer
+        // errors (unsupported chain) or a pathological runtime. Keep the
+        // KyberSwap-specific mapping in case the SDK is ever called in a
+        // non-fan-out mode again — harmless when dead.
         if (err instanceof KyberSwapError) {
           set.status = err.status >= 400 && err.status < 600 ? err.status : 502;
           return {
