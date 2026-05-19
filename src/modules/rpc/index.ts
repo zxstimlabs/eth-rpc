@@ -39,7 +39,7 @@ if (!ETHEREUM_RPC_URL) {
  * typical burst of calls a wallet/dapp makes on page load without
  * exhausting the upstream provider quota.
  */
-const RATE_LIMIT_MAX = 20;
+const RATE_LIMIT_MAX = 200;
 const RATE_LIMIT_DURATION_MS = 60_000;
 
 // --- Controller ------------------------------------------------------------
