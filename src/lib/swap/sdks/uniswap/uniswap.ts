@@ -223,6 +223,20 @@ export interface UniswapClientOptions {
    * you have verified the new command encoding.
    */
   universalRouterVersion?: string;
+  /**
+   * If true, sends `x-permit2-disabled: true` on every request. The
+   * Trading API then returns CLASSIC quotes with `permitData: null` and
+   * the resulting swap calldata expects the taker to have a LEGACY
+   * approval on the Universal Router (i.e. `approve(UR, amount)` on the
+   * sell token) rather than going through Permit2 + EIP-712 signing.
+   *
+   * Default false. Set this when the caller can't sign Permit2 messages
+   * — typical for server-side flows and backend services. Without this,
+   * ERC20 swaps return calldata that requires a wallet signature, and
+   * submitting them without one results in on-chain reverts (native
+   * swaps "just work" because they don't transfer ERC20 in).
+   */
+  disablePermit2?: boolean;
   /** Custom fetch implementation (testing, retries, instrumentation). */
   fetch?: typeof fetch;
   /** Per-request timeout in ms. Omit to disable. */
@@ -243,6 +257,7 @@ export class UniswapClient {
   private readonly baseUrl: string;
   private readonly defaultChainId?: UniswapChainId;
   private readonly universalRouterVersion: string;
+  private readonly disablePermit2: boolean;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs?: number;
 
@@ -255,6 +270,7 @@ export class UniswapClient {
     this.defaultChainId = options.defaultChainId;
     this.universalRouterVersion =
       options.universalRouterVersion ?? DEFAULT_UNIVERSAL_ROUTER_VERSION;
+    this.disablePermit2 = options.disablePermit2 ?? false;
     this.fetchImpl = options.fetch ?? fetch;
     this.timeoutMs = options.timeoutMs;
   }
@@ -394,6 +410,9 @@ export class UniswapClient {
       "Content-Type": "application/json",
       Accept: "application/json",
     };
+    if (this.disablePermit2) {
+      headers["x-permit2-disabled"] = "true";
+    }
 
     const { signal, cancel } = composeSignals(externalSignal, this.timeoutMs);
 

@@ -86,7 +86,14 @@ export type SwapAggRoute = {
   priceImpactBps?: number;
   gas?: string;
   gasUsd?: string;
-  /** Contract to send the swap transaction to. */
+  /**
+   * Contract to send the swap transaction to. For ERC20 input tokens
+   * this is ALSO the address the user must have an ERC20 allowance to
+   * (i.e. the spender on `approve(spender, amount)`) — it varies per
+   * aggregator and per quote, so do NOT hardcode an approval target;
+   * read this field on each route. Native-token swaps don't need an
+   * approval at all.
+   */
   routerAddress: string;
   /** Encoded calldata to submit to `routerAddress`. */
   data: string;

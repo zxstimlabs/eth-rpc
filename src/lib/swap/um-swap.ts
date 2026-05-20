@@ -91,7 +91,17 @@ if (!UNISWAP_API_KEY) {
  */
 const kyberSwapClient = new KyberSwapClient({ clientId: KYBERSWAP_CLIENT_ID });
 const zeroxClient = new ZeroxClient({ apiKey: ZEROX_API_KEY });
-const uniswapClient = new UniswapClient({ apiKey: UNISWAP_API_KEY });
+// `disablePermit2: true` puts the Trading API into legacy-approval mode:
+// the response calldata expects the taker to have a direct `approve()` on
+// the Universal Router (no Permit2 signature). This is the only viable
+// flow for a server-side fan-out — we can't sign Permit2 EIP-712 messages
+// on behalf of the user. Without this flag, ERC20 swaps return calldata
+// that reverts on-chain because no Permit2 authorization was provided
+// (native swaps still work because they don't transfer ERC20 in).
+const uniswapClient = new UniswapClient({
+  apiKey: UNISWAP_API_KEY,
+  disablePermit2: true,
+});
 
 // --- Chain mapping ---------------------------------------------------------
 
