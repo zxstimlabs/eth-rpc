@@ -1,14 +1,14 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "cb6d5d5e-37cf-44da-9c22-dfc948cdf1cd",
+  "id": "7ae2c261-be54-412e-a5e6-1710d49dc41f",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
-    "markets": {
-      "name": "markets",
+    "coins": {
+      "name": "coins",
       "columns": {
-        "coin_id": {
-          "name": "coin_id",
+        "coingecko_id": {
+          "name": "coingecko_id",
           "type": "text",
           "primaryKey": true,
           "notNull": true,
@@ -28,15 +28,181 @@
           "notNull": true,
           "autoincrement": false
         },
-        "image": {
-          "name": "image",
+        "logo_uri": {
+          "name": "logo_uri",
           "type": "text",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
         },
-        "current_price": {
-          "name": "current_price",
+        "um_curated": {
+          "name": "um_curated",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": true
+        },
+        "description": {
+          "name": "description",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "links": {
+          "name": "links",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "categories": {
+          "name": "categories",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "sentiment_up": {
+          "name": "sentiment_up",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "sentiment_down": {
+          "name": "sentiment_down",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "community": {
+          "name": "community",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "developer": {
+          "name": "developer",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "profile_updated_at": {
+          "name": "profile_updated_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(unixepoch('subsec') * 1000)"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "deployments": {
+      "name": "deployments",
+      "columns": {
+        "chain_id": {
+          "name": "chain_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "address": {
+          "name": "address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "coingecko_id": {
+          "name": "coingecko_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "decimals": {
+          "name": "decimals",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(unixepoch('subsec') * 1000)"
+        }
+      },
+      "indexes": {
+        "deployments_coingecko_id_idx": {
+          "name": "deployments_coingecko_id_idx",
+          "columns": [
+            "coingecko_id"
+          ],
+          "isUnique": false
+        },
+        "deployments_chain_id_idx": {
+          "name": "deployments_chain_id_idx",
+          "columns": [
+            "chain_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "deployments_chain_id_address_pk": {
+          "columns": [
+            "chain_id",
+            "address"
+          ],
+          "name": "deployments_chain_id_address_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "markets": {
+      "name": "markets",
+      "columns": {
+        "coingecko_id": {
+          "name": "coingecko_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "vs_currency": {
+          "name": "vs_currency",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'usd'"
+        },
+        "price": {
+          "name": "price",
           "type": "real",
           "primaryKey": false,
           "notNull": false,
@@ -98,44 +264,9 @@
           "notNull": false,
           "autoincrement": false
         },
-        "market_cap_change_24h": {
-          "name": "market_cap_change_24h",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "market_cap_change_percentage_24h": {
-          "name": "market_cap_change_percentage_24h",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "price_change_percentage_1h_in_currency": {
-          "name": "price_change_percentage_1h_in_currency",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "circulating_supply": {
-          "name": "circulating_supply",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "total_supply": {
-          "name": "total_supply",
-          "type": "real",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "max_supply": {
-          "name": "max_supply",
-          "type": "real",
+        "price_change_percentage": {
+          "name": "price_change_percentage",
+          "type": "text",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
@@ -182,8 +313,29 @@
           "notNull": false,
           "autoincrement": false
         },
-        "roi": {
-          "name": "roi",
+        "circulating_supply": {
+          "name": "circulating_supply",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "total_supply": {
+          "name": "total_supply",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "max_supply": {
+          "name": "max_supply",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "sparkline_7d": {
+          "name": "sparkline_7d",
           "type": "text",
           "primaryKey": false,
           "notNull": false,

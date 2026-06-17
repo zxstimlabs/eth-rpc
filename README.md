@@ -1,11 +1,14 @@
 # UnitMetal API
 
-An [Elysia](https://elysiajs.com) / [Bun](https://bun.sh) backend that exposes two public endpoints for a crypto frontend:
+An [Elysia](https://elysiajs.com) / [Bun](https://bun.sh) backend that exposes a set of public, browser-callable endpoints for a crypto frontend:
 
-- **`POST /rpc/ethereum`** — a privacy-preserving JSON-RPC proxy to the upstream Ethereum provider.
+- **`POST /rpc/{ethereum,arbitrum,base}`** — privacy-preserving JSON-RPC proxies to the upstream providers.
 - **`GET /prices/ethereum`** — on-chain USD prices for every token in the bundled token list, fetched in a single multicall.
+- **`POST /swapagg/ethereum`** — best-effort swap routes fanned out across KyberSwap, 0x, and Uniswap in one round-trip.
+- **`GET /markets`** — a cached CoinGecko market snapshot, refreshed by a background cron job.
+- **`GET /tokens/{ethereum,arbitrum,base}`** — the curated UnitMetal token list, filtered per chain.
 
-Both endpoints are designed to be called directly from a browser: open CORS, per-client rate limiting, zero logging, and no persistence of client data.
+Every endpoint is designed to be called directly from a browser: open CORS, per-client rate limiting, zero request logging, and no persistence of client data. The only thing persisted server-side is the cached `/markets` snapshot — market data, never client data.
 
 ## Getting Started
 
@@ -47,36 +50,50 @@ SQLite via `bun:sqlite` (built into Bun, no native addon to compile), with [Driz
 
 ```
 src/
-├── index.ts                    # Root Elysia app — mounts feature modules, listens on :8000
-├── data/
-│   └── token-list.json         # Uniswap-format token list (Ethereum mainnet)
+├── index.ts                      # Root Elysia app — mounts every module, warms the markets cache, listens on :8000
+├── config/                       # Per-feature server-side defaults (rate limits, fees, timeouts). Never client-supplied.
+│   ├── rpc.ts
+│   ├── swapagg.ts                # Per-aggregator fee policy, pinned to the treasury address
+│   ├── markets.ts                # Curated CoinGecko coin list + refresh cadence
+│   └── tokens.ts
+├── data/                         # Static-ish JSON lists, imported once at module load
+│   ├── uniswap-token-list.json   # Source for the /tokens endpoints (refresh via script)
+│   ├── token-list.json           # Ethereum token list used by /prices
+│   └── *-token-list.json         # Per-chain lists produced by create-token-lists.ts
 ├── lib/
+│   ├── db.ts                     # Process-wide bun:sqlite handle (WAL) + Drizzle
+│   ├── client-id.ts              # Salted SHA-256 hash of client IP (shared by every rate limiter)
+│   ├── constants.ts              # On-chain addresses (CheckTheChain oracle, UnitMetal treasury)
 │   ├── abis/
-│   │   └── check-the-chain-abi.ts   # CheckTheChain contract ABI
-│   ├── client-id.ts            # Salted SHA-256 hash of client IP (shared by rate limiters)
-│   └── constants.ts            # CHECK_THE_CHAIN_CONTRACT_ADDRESS
-├── modules/
-│   ├── rpc/
-│   │   ├── index.ts            # Controller: CORS + rate limit + route wiring
-│   │   └── service.ts          # RpcService: header-sanitizing request forwarder
-│   └── prices/
-│       ├── index.ts            # Controller: CORS + rate limit + route wiring
-│       └── service.ts          # PricesService: viem multicall against CheckTheChain
-├── test/
-│   ├── root.test.ts            # Covers GET /
-│   ├── rpc.test.ts             # Mocks fetch; asserts header stripping + CORS + passthrough
-│   └── prices.test.ts          # Hits real upstream; asserts response shape
-└── types/
-    └── prices.ts               # TokenPrice, PricesResponse
+│   │   └── check-the-chain-abi.ts
+│   └── swap/
+│       ├── um-swap.ts            # umSwap: umbrella SDK that fans out to all aggregators
+│       └── sdks/                 # Per-provider clients: kyberswap, zerox, uniswap
+├── modules/                      # Feature modules — one controller (index.ts) + service (service.ts) each
+│   ├── rpc/                      # Header-sanitizing JSON-RPC proxy
+│   ├── prices/                   # viem multicall against CheckTheChain
+│   ├── swapagg/                  # Swap-route fan-out over umSwap
+│   ├── markets/                  # Cached CoinGecko snapshot (index.ts owns the cron; schema.ts is the table)
+│   └── tokens/                   # Chain-filtered token list with bridge expansion
+├── script/                       # One-off runners: `bun run src/script/<name>.ts`
+│   ├── migrate.ts                # Applies ./drizzle migrations via bun:sqlite (works inside the compiled binary)
+│   ├── uniswap-token-list.ts     # Refresh data/uniswap-token-list.json
+│   ├── create-token-lists.ts     # Build per-chain token lists from CoinGecko
+│   └── fetch-coingecko-markets.ts
+├── test/                         # Bun tests (root, rpc, prices, swapagg, tokens)
+└── types/                        # Shared response types (prices, swapagg, tokens)
 ```
 
 ### Architecture
 
 The app follows Elysia's recommended **feature-based module** pattern ([MVC guide](https://elysiajs.com/patterns/mvc.html)): each feature lives under `src/modules/<feature>/` with a controller (`index.ts`) and a service (`service.ts`).
 
-- **Controller (`index.ts`)** — an Elysia instance that owns the prefix, mounts plugins (`@elysiajs/cors`, `elysia-rate-limit`), and registers routes. Route handlers are thin wrappers that delegate to the service.
-- **Service (`service.ts`)** — an abstract class of static methods with no Elysia dependency. All business logic (proxying bytes, calling viem) lives here, which makes the service trivial to unit-test without spinning up an HTTP server.
-- **Root app (`src/index.ts`)** — imports each module and mounts it via `.use(module)`. Adding a new feature = add a new folder under `modules/` and one `.use()` call.
+- **Controller (`index.ts`)** — an Elysia instance that owns the prefix, mounts plugins (`@elysiajs/cors`, `elysia-rate-limit`, and `@elysia/cron` where needed), and registers routes. Route handlers are thin wrappers that delegate to the service.
+- **Service (`service.ts`)** — an abstract class of static methods with no Elysia dependency. All business logic (proxying bytes, calling viem, querying SQLite) lives here, which makes the service trivial to unit-test without spinning up an HTTP server.
+- **Root app (`src/index.ts`)** — imports each module and mounts it via `.use(module)`. Adding a new feature = add a new folder under `modules/` and one `.use()` call. It also awaits one `MarketsService.refreshMarkets()` before `.listen()` so `/markets` isn't empty during the window before the first cron tick.
+- **Per-feature config (`src/config/`)** — server-side defaults (rate-limit budgets, swap fee policy, timeouts) kept out of the controllers. These are applied server-side and never accepted from the client, so fee/policy can't be tampered with.
+- **Shared libraries (`src/lib/`)** — cross-module helpers: the SQLite/Drizzle handle (`db.ts`), the client-id hasher (`client-id.ts`), on-chain constants, and the swap SDK.
+- **Swap aggregation (`src/lib/swap/`)** — `umSwap.getSwap(chain, req)` fans out to KyberSwap, 0x, and Uniswap in parallel via `Promise.allSettled`, normalizes each response, and returns them keyed by aggregator. It lives in `lib/` (not `modules/`) so non-HTTP callers can reuse it; the `swapagg` module is just one consumer.
 
 **Privacy primitives are deliberately shared, not duplicated.** `src/lib/client-id.ts` exports `hashClientIp(ip)`: a SHA-256 over a process-lifetime random salt plus the IP. Both rate limiters call it, so the in-memory LRU stores only opaque hex digests. The salt never leaves the process, so a memory dump of the rate-limit cache cannot be reversed back to IPs without also capturing the salt at the same moment.
 
@@ -159,7 +176,7 @@ const RATE_LIMIT_DURATION_MS = 60_000;
 The goal across the whole app is: **the upstream RPC provider cannot distinguish customers, and this server never stores customer information.** Concretely:
 
 - **No logging.** Neither module calls `console.log`, no access logs, no request/response bodies written anywhere. The only log is a single startup line in `src/index.ts`.
-- **No persistence.** There is no database, no disk writes, no cookies issued.
+- **No persistence of client data.** The only thing written to disk is the cached `/markets` snapshot (public market data fetched from CoinGecko on a cron, keyed by coin — never tied to a client). No request bodies, no cookies, no per-client rows.
 - **IPs are not stored in plaintext.** The rate-limit LRU stores salted hashes only; the salt is in-process memory and dies with the process.
 - **Customer headers are dropped, not passed through.** `RpcService.proxy` uses an allowlist (not a denylist), so new browser fingerprinting headers are blocked by default.
 - **User-Agent is overwritten.** Every outbound request carries `unitmetal-api/1.0` regardless of what the customer sent.

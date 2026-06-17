@@ -3,18 +3,18 @@ import { openapi } from "@elysia/openapi";
 import { rpc } from "./modules/rpc";
 import { prices } from "./modules/prices";
 import { swapagg } from "./modules/swapagg";
-import { markets } from "./modules/markets";
-import { MarketsService } from "./modules/markets/service";
+import { tokens } from "./modules/tokens";
+import { TokensRefresh } from "./modules/tokens/refresh";
 
-// Warm the markets cache before accepting traffic. The cron job inside
-// the markets module only fires every 5 minutes, so without this the
-// first responses to `/markets` after a cold boot would be empty.
-// A failure here is logged but non-fatal — the next cron tick will retry,
-// and we'd rather serve an empty list briefly than refuse to start.
+// Warm the tokens market cache before accepting traffic. The market-refresh
+// cron only fires every ~15 minutes, so without this the first `/tokens`
+// responses after a cold boot would be empty. A failure here is logged but
+// non-fatal — the next cron tick retries, and we'd rather serve a thin list
+// briefly than refuse to start. (Profiles fill in on the daily sweep.)
 try {
-  await MarketsService.refreshMarkets();
+  await TokensRefresh.refreshMarkets();
 } catch (err) {
-  console.error("[markets] cold-start refresh failed:", err);
+  console.error("[tokens] cold-start market refresh failed:", err);
 }
 
 const app = new Elysia()
@@ -23,7 +23,7 @@ const app = new Elysia()
   .use(rpc)
   .use(prices)
   .use(swapagg)
-  .use(markets)
+  .use(tokens)
   .listen(8000);
 
 console.log(

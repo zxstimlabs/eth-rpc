@@ -2,7 +2,8 @@
  * RPC Module (controller)
  * -----------------------
  * Exposes public `/rpc/*` endpoints that proxy JSON-RPC requests to
- * blockchain providers. Currently only Ethereum is wired up.
+ * blockchain providers. Each supported chain has a path (`/rpc/ethereum`,
+ * `/rpc/arbitrum`, `/rpc/base`, …) backed by its own upstream URL.
  *
  * This file is the Elysia "controller" for the feature: it wires together
  * CORS, per-client rate limiting, and the RpcService (which does the actual
@@ -14,33 +15,33 @@ import { Elysia } from "elysia";
 import { cors } from "@elysiajs/cors";
 import { rateLimit } from "elysia-rate-limit";
 import { hashClientIp } from "../../lib/client-id";
+import { rpcConfig } from "../../config/rpc";
 import { RpcService } from "./service";
 
 // --- Configuration ---------------------------------------------------------
 
 /**
- * Upstream Ethereum JSON-RPC endpoint. Read once at module load from
- * `.env.local` (Bun auto-loads it). The process refuses to start without
- * it — failing fast here is better than returning 500s at runtime.
+ * Upstream JSON-RPC endpoints, one per supported chain. Read once at
+ * module load from `.env.local` (Bun auto-loads it). The process refuses
+ * to start without any of them — failing fast here is better than
+ * returning 500s at runtime when a particular chain's path is hit.
+ *
+ * When you add a new chain: add its env var here, add the null check,
+ * and add a matching `.all("/{chain}", ...)` route below.
  */
 const ETHEREUM_RPC_URL = process.env.ETHEREUM_RPC_URL;
+const ARBITRUM_RPC_URL = process.env.ARBITRUM_RPC_URL;
+const BASE_RPC_URL = process.env.BASE_RPC_URL;
 
 if (!ETHEREUM_RPC_URL) {
   throw new Error("ETHEREUM_RPC_URL is not set");
 }
-
-/**
- * Rate-limit tunables. Adjust these to change per-client throughput.
- *
- *   RATE_LIMIT_MAX          — requests allowed inside the window
- *   RATE_LIMIT_DURATION_MS  — window length in milliseconds
- *
- * The current setting (20 per 60s per client) is chosen to absorb the
- * typical burst of calls a wallet/dapp makes on page load without
- * exhausting the upstream provider quota.
- */
-const RATE_LIMIT_MAX = 200;
-const RATE_LIMIT_DURATION_MS = 60_000;
+if (!ARBITRUM_RPC_URL) {
+  throw new Error("ARBITRUM_RPC_URL is not set");
+}
+if (!BASE_RPC_URL) {
+  throw new Error("BASE_RPC_URL is not set");
+}
 
 // --- Controller ------------------------------------------------------------
 
@@ -57,8 +58,8 @@ export const rpc = new Elysia({ prefix: "/rpc" })
   .use(cors({ origin: true, credentials: false }))
   .use(
     rateLimit({
-      max: RATE_LIMIT_MAX,
-      duration: RATE_LIMIT_DURATION_MS,
+      max: rpcConfig.rateLimit.max,
+      duration: rpcConfig.rateLimit.durationMs,
 
       // "scoped" confines the limiter to this Elysia instance and its
       // descendants. Without this override the plugin defaults to
@@ -86,12 +87,14 @@ export const rpc = new Elysia({ prefix: "/rpc" })
       },
     })
   )
-  // `.all()` accepts any HTTP method so the endpoint behaves as a
-  // drop-in for the upstream RPC URL. Ethereum JSON-RPC is POST in
-  // practice, but being permissive costs nothing and avoids surprising
-  // library behaviour.
-  //
-  // The final path is `/rpc/ethereum` (prefix + route).
+  // `.all()` accepts any HTTP method so each endpoint behaves as a
+  // drop-in for the upstream RPC URL. JSON-RPC is POST in practice, but
+  // being permissive costs nothing and avoids surprising library
+  // behaviour. Final paths are `/rpc/{chain}` (prefix + route).
   .all("/ethereum", ({ request }) =>
     RpcService.proxy(request, ETHEREUM_RPC_URL)
-  );
+  )
+  .all("/arbitrum", ({ request }) =>
+    RpcService.proxy(request, ARBITRUM_RPC_URL)
+  )
+  .all("/base", ({ request }) => RpcService.proxy(request, BASE_RPC_URL));

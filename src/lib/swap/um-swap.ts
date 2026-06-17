@@ -314,7 +314,7 @@ async function fetchZeroxRoute(
   const gas = typeof tx.gas === "string" ? tx.gas : undefined;
 
   return {
-    name: "zerox",
+    name: "zerox-swap",
     tokenIn: req.tokenIn,
     tokenOut: req.tokenOut,
     amountIn,
