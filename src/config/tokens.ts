@@ -30,12 +30,12 @@ export type ChainSlug = (typeof CHAINS)[number]["slug"];
 
 /** CoinGecko asset-platform slug → numeric chainId, derived from `CHAINS`. */
 export const PLATFORM_TO_CHAIN_ID: Record<string, number> = Object.fromEntries(
-  CHAINS.map((c) => [c.platform, c.chainId])
+  CHAINS.map((c) => [c.platform, c.chainId]),
 );
 
 /** Public chain slug → numeric chainId, derived from `CHAINS`. */
 export const SLUG_TO_CHAIN_ID: Record<string, number> = Object.fromEntries(
-  CHAINS.map((c) => [c.slug, c.chainId])
+  CHAINS.map((c) => [c.slug, c.chainId]),
 );
 
 /**
@@ -57,6 +57,20 @@ export const tokensConfig = {
   /** Bumped manually when the projection shape changes. */
   version: "1.0.0",
 
+  /**
+   * Metadata envelope for `GET /tokens/list/:chain` (the fixed curated list).
+   * Mirrors the Uniswap token-list schema (name/timestamp/version/tags) so the
+   * frontend can consume it with the same tooling. `timestamp` and `version`
+   * are static publish markers — bump them by hand whenever the curated lists
+   * in `src/data/tokens.ts` are regenerated.
+   */
+  curatedList: {
+    name: "UnitMetal Token List",
+    timestamp: "2026-06-28T00:00:00.000Z",
+    version: "0.0.1",
+    tags: {},
+  },
+
   /** Canonical pricing currency. Multi-currency comes later via an FX layer. */
   vsCurrency: "usd",
 
@@ -72,7 +86,12 @@ export const tokensConfig = {
   priceChangeTimeframes: ["1h", "24h", "7d"] as const,
 
   /** `include=` blocks the read endpoint knows how to serve. */
-  includeBlocks: ["description", "sparkline", "community", "developer"] as const,
+  includeBlocks: [
+    "description",
+    "sparkline",
+    "community",
+    "developer",
+  ] as const,
 
   /** Sort keys the read endpoint accepts. */
   sortKeys: ["marketCap", "rank", "volume", "priceChange24h", "name"] as const,

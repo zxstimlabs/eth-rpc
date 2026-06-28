@@ -307,6 +307,55 @@ describe("TokensService.list — pagination", () => {
   });
 });
 
+// --- curated list (GET /tokens/list/:chain) --------------------------------
+
+describe("TokensService.curatedList", () => {
+  test("wraps the tokens in the Uniswap token-list envelope", async () => {
+    const { tokensConfig } = await import("../config/tokens");
+    const res = TokensService.curatedList("ethereum");
+
+    // Metadata mirrors tokensConfig.curatedList; the array lives under `tokens`.
+    expect(res.name).toBe(tokensConfig.curatedList.name);
+    expect(res.version).toBe(tokensConfig.curatedList.version);
+    expect(res.timestamp).toBe(tokensConfig.curatedList.timestamp);
+    expect(res.tags).toEqual({});
+    expect(Array.isArray(res.tokens)).toBe(true);
+  });
+
+  test("serializes keys in name/timestamp/version/tags/tokens order", () => {
+    expect(Object.keys(TokensService.curatedList("ethereum"))).toEqual([
+      "name",
+      "timestamp",
+      "version",
+      "tags",
+      "tokens",
+    ]);
+  });
+
+  test("returns each chain's own curated list", async () => {
+    const { curatedTokens } = await import("../data/tokens");
+    for (const chain of ["ethereum", "arbitrum", "base"] as const) {
+      const res = TokensService.curatedList(chain);
+      expect(res.tokens).toBe(curatedTokens[chain]);
+      // Every entry is tagged with that chain's id.
+      const ids = new Set(res.tokens.map((t) => t.chainId));
+      expect(ids.size).toBeLessThanOrEqual(1);
+    }
+  });
+
+  test("entries carry the curated-token identity shape", () => {
+    const first = TokensService.curatedList("ethereum").tokens[0];
+    expect(first).toMatchObject({
+      chainId: expect.any(Number),
+      address: expect.any(String),
+      symbol: expect.any(String),
+      name: expect.any(String),
+      decimals: expect.any(Number),
+      coingeckoId: expect.any(String),
+    });
+  });
+});
+
 // --- detail ----------------------------------------------------------------
 
 describe("TokensService.get", () => {

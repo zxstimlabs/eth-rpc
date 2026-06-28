@@ -21,7 +21,6 @@ import { cors } from "@elysiajs/cors";
 import { rateLimit } from "elysia-rate-limit";
 import { hashClientIp } from "../../lib/client-id";
 import { CHAINS, tokensConfig } from "../../config/tokens";
-import { curatedTokens } from "../../data/tokens";
 import { TokensService, type ListParams, type SortKey } from "./service";
 import { TokensRefresh } from "./refresh";
 
@@ -157,9 +156,10 @@ export const tokens = new Elysia({ prefix: "/tokens" })
   // GET /tokens/list/:chain — the fixed, curated token list for one chain
   // (identity + decimals), served straight from src/data/tokens.ts. This is
   // the static "supported tokens" set the frontend pairs with RPC balances
-  // and `/tokens` prices; it never touches the catalog DB. Returns a bare
-  // `UmCuratedToken[]` (same as `/prices`).
-  .get("/list/:chain", ({ params }) => curatedTokens[params.chain], {
+  // and `/tokens` prices; it never touches the catalog DB. Returns a Uniswap
+  // token-list envelope (name/timestamp/version/tags) wrapping the
+  // `UmCuratedToken[]` under `tokens`.
+  .get("/list/:chain", ({ params }) => TokensService.curatedList(params.chain), {
     params: t.Object({
       chain: t.Union(CHAINS.map((c) => t.Literal(c.slug))),
     }),

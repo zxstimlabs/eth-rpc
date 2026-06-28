@@ -12,7 +12,13 @@
 
 import { and, asc, count, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { db } from "../../lib/db";
-import { SLUG_TO_CHAIN_ID, tokensConfig } from "../../config/tokens";
+import {
+  SLUG_TO_CHAIN_ID,
+  tokensConfig,
+  type ChainSlug,
+} from "../../config/tokens";
+import { curatedTokens } from "../../data/tokens";
+import type { UmCuratedToken } from "../../types/um-curated-token";
 import type {
   Token,
   TokenDeployment,
@@ -29,6 +35,18 @@ import {
 } from "./schema";
 
 export type SortKey = (typeof tokensConfig.sortKeys)[number];
+
+/**
+ * The `/tokens/list/:chain` payload: a Uniswap token-list envelope
+ * (name/timestamp/version/tags) wrapping the curated tokens for one chain.
+ */
+export type CuratedTokenList = {
+  name: string;
+  timestamp: string;
+  version: string;
+  tags: Record<string, unknown>;
+  tokens: UmCuratedToken[];
+};
 
 export type ListParams = {
   chain: string | null;
@@ -245,6 +263,18 @@ export abstract class TokensService {
       description: true,
       priceChange: [...tokensConfig.priceChangeTimeframes],
     });
+  }
+
+  /**
+   * The fixed, curated token list for one chain, wrapped in a Uniswap
+   * token-list envelope. Static: reads `src/data/tokens.ts` plus the
+   * `tokensConfig.curatedList` metadata — never the catalog DB.
+   */
+  static curatedList(chain: ChainSlug): CuratedTokenList {
+    return {
+      ...tokensConfig.curatedList,
+      tokens: curatedTokens[chain],
+    };
   }
 
   /** Build the WHERE for `list` from the parsed params. */
