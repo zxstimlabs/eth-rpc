@@ -118,7 +118,7 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
-      packages: read # pull the image on the server (token passed via stdin, logged out after)
+      packages: read # the server pulls the private image with this token (stdin → RAM-only Docker config)
       id-token: write # Tailscale OIDC
     env:
       DEPLOY_HOST: zxstim-rpc.tail2e11cd.ts.net

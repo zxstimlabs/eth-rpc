@@ -3,7 +3,7 @@
 # Runs ON THE SERVER as the `deploy` user. The CI/CD workflow uploads it
 # with compose.yaml to /opt/<stack>/ and runs it over Tailscale SSH:
 #
-#   deploy.sh <stack> <host-port> <image-ref>      (stdin: GHCR read token, optional)
+#   deploy.sh <stack> <host-port> <image-ref>      (stdin: GHCR read token; omit if the image is public)
 #
 #   stack       zxstim-rpc (production, main) | zxstim-rpc-dev (develop)
 #   host-port   127.0.0.1 port the app is published on (8001 | 8002)
@@ -16,7 +16,7 @@
 #
 # Safe to keep in the public repo: it holds no secrets. Secrets reach the
 # server only at deploy time (.env.next over SSH; registry token on stdin,
-# never argv). Its output lands in public workflow logs, so it never prints
+# never argv, held only in RAM). Its output lands in public workflow logs, so it never prints
 # secret values or container logs.
 
 set -euo pipefail
@@ -31,20 +31,32 @@ compose() {
 }
 
 healthy() {
+  # -s without -S: connection resets while the app is still starting are
+  # expected for the first second or two; don't print them.
   for _ in $(seq 1 30); do
-    curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$port/health" && return 0
+    curl -fs -o /dev/null --max-time 2 "http://127.0.0.1:$port/health" && return 0
     sleep 1
   done
   return 1
 }
 
-# Registry login only for this pull; logged out again on exit. The token is
-# the workflow's short-lived GITHUB_TOKEN (packages: read).
+# Registry login, only if a token was piped in (the image is private). The
+# token is the workflow's short-lived GITHUB_TOKEN (packages: read). It goes
+# into a throwaway Docker config on tmpfs (RAM), removed on exit, so it
+# never touches disk and ~/.docker/config.json is never used. Docker's
+# "stored unencrypted" warning refers to that file, so it's dropped;
+# a failed login still stops the deploy. With no token (public image),
+# pulls are anonymous.
 token=""
 [ -t 0 ] || token=$(cat)
 if [ -n "$token" ]; then
-  printf '%s' "$token" | docker login ghcr.io -u github-actions --password-stdin >/dev/null
-  trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+  DOCKER_CONFIG=$(mktemp -d /dev/shm/deploy-docker.XXXXXX)
+  export DOCKER_CONFIG
+  trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+  if ! printf '%s' "$token" | docker login ghcr.io -u github-actions --password-stdin >/dev/null 2>&1; then
+    echo "deploy: registry login to ghcr.io failed" >&2
+    exit 1
+  fi
 fi
 unset token
 
