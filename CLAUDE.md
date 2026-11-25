@@ -55,12 +55,20 @@ Copy `src/modules/rpc/index.ts` when adding a module:
 
 `.all("/{chain}", ...)` proxies JSON-RPC byte-for-byte. `RpcService.proxy` uses a header **allowlist** (new fingerprinting headers are blocked by default) and overwrites `User-Agent` to a fixed value so the upstream can't distinguish customers. It strips `content-encoding` / `content-length` / `transfer-encoding` from the upstream response because Bun's `fetch` has already decompressed the body. To add a chain: add a `requireEnv(...)` line at the top of `src/modules/rpc/index.ts`, a matching `.all()` route, the var in `.env.example`, and a row in the routing `test.each` in `src/test/rpc.test.ts`. One rate-limit budget (`src/config/rpc.ts`) covers all chains.
 
+## Deployment
+
+- `.github/workflows/ci-cd.yml`: push `develop` → GitHub env **develop** → stack `zxstim-rpc-dev` (127.0.0.1:8002); push `main` → env **production** → stack `zxstim-rpc` (127.0.0.1:8001, behind nginx). PRs run tests only. Actions are pinned by commit SHA; keep it that way when bumping.
+- Server = Tailscale machine `zxstim-rpc` (Hetzner, Ubuntu 26.04). The runner joins as `tag:ci` via a per-environment Tailscale OIDC credential (GitHub vars `TS_CLIENT_ID`/`TS_AUDIENCE`) and SSHes as `deploy` (the only user tag:ci may use). `deploy/deploy.sh` runs there: swaps `.env.next` → `.env`, pulls, restarts, checks `/health`, rolls back on failure.
+- **Public repo ⇒ public workflow logs.** Never echo secrets, `.env` contents, or container logs in the workflow or `deploy.sh`. Secrets go over SSH stdin, never argv.
+- Adding an env var the app needs: add it to both GitHub environments, to the `.env` writer step in the workflow, to `.env.example`, and to the test env (`deploy/compose.test.yaml` and the workflow's test job).
+- `TRUST_PROXY=1` (set in `deploy/compose.yaml`) makes the rate limiter key on nginx's `X-Real-IP`. It's only safe because the app port is bound to 127.0.0.1. Never publish the app port publicly with it on.
+
 ## Privacy posture (do not regress)
 
 - **No request logging.** The only `console.log` is the startup line. Don't add logging to the Redis/rate-limit failure paths either. Don't add access logs, request/response body logging, or per-customer APM attributes.
 - **No client PII persisted.** No cookies, no IPs in plaintext (rate-limit store holds salted hashes only). Nothing is written to disk: Redis runs with persistence off and every counter expires with its window.
 - **Header allowlist, not denylist** for the RPC proxy; fixed outbound `User-Agent`.
-- **Reverse-proxy caveat:** rate-limit keys on `server.requestIP()` (direct TCP peer). Behind an LB/CDN every client collapses to one bucket — the fix is to read a trusted `x-forwarded-for` in the module's `generator`, but only once the deployment actually sits behind a trusted proxy.
+- **Client IP for rate limiting:** `clientIp()` in `src/lib/client-id.ts`. Behind nginx it uses `X-Real-IP` (only with `TRUST_PROXY=1`); otherwise the TCP peer, via the server registered with `setListeningServer()` (sub-apps can't see `app.server`; before this fix every client shared the "" bucket). If a CDN proxy (e.g. Cloudflare orange-cloud) is ever put in front, nginx must restore the real client IP (`real_ip_header`) or everyone collapses into the CDN's IPs.
 
 ## Conventions
 

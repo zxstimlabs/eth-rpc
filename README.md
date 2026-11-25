@@ -39,7 +39,7 @@ All six RPC URLs (mainnet and testnet) are required — the RPC module reads the
 
 ```
 src/
-├── index.ts              # Root Elysia app — mounts the rpc module, listens on :8000
+├── index.ts              # Root Elysia app — connects Redis, mounts the rpc module, /health, listens on :8000
 ├── config/
 │   └── rpc.ts            # Server-side rate-limit budget. Never client-supplied.
 ├── lib/
@@ -103,11 +103,26 @@ The goal across the whole app is: **the upstream RPC provider cannot distinguish
 - **Customer headers are dropped, not passed through.** `RpcService.proxy` uses an allowlist (not a denylist), so new browser fingerprinting headers are blocked by default.
 - **User-Agent is overwritten.** Every outbound request carries `zxstim-rpc/1.0` regardless of what the customer sent.
 
-## Deployment note — reverse proxies
+## Deployment note — client IPs behind nginx
 
-The rate-limit generator uses `server.requestIP(request)`, which returns the direct TCP peer. If you deploy behind a load balancer, CDN, or any reverse proxy, every customer will share the LB's IP and be bucketed together.
+The app sits behind nginx (TLS) and Docker, so its TCP peer is never the real client. With `TRUST_PROXY=1` (set in `deploy/compose.yaml`) the rate limiter keys on the `X-Real-IP` header that nginx overwrites with `$remote_addr`. That is only safe because the container port is bound to `127.0.0.1`, so clients can't reach the app directly and forge the header. If a CDN proxy is ever added in front of nginx, nginx must restore the real client IP first (e.g. `real_ip_header CF-Connecting-IP` plus the CDN's ranges), or every client collapses into the CDN's addresses.
 
-When that happens, update the `generator` in `src/modules/rpc/index.ts` to read the real client IP from `x-forwarded-for` (and trust it only from the LB — not from arbitrary clients). Do it in the generator *before* `RpcService.proxy` strips that header for the outbound request.
+## Deployment (CI/CD)
+
+`.github/workflows/ci-cd.yml` — push to deploy, nothing manual:
+
+| Event | Jobs | Target |
+|---|---|---|
+| PR into `main` / `develop` | test | — |
+| push `develop` | test → build → deploy | GitHub env **develop** → stack `zxstim-rpc-dev` on `127.0.0.1:8002` (internal only) |
+| push `main` | test → build → deploy | GitHub env **production** → stack `zxstim-rpc` on `127.0.0.1:8001` (nginx: `rpc.zxstim.com`, `api.unitmetal.com`) |
+
+- **Image:** `ghcr.io/zxstimlabs/eth-rpc:<commit-sha>` (+ `:<branch>`), built from the `Dockerfile` `runtime` target. It contains no secrets.
+- **Secrets** (the six `*_RPC_URL`) live in the GitHub environment and only reach the server at deploy time, as `/opt/<stack>/.env` (mode 600).
+- **Access:** the runner joins Tailscale with a per-environment OIDC credential (no stored secret) as `tag:ci`, which the tailnet policy lets reach only `tag:server`'s SSH, as user `deploy`. The server has no public SSH.
+- **On the server:** `deploy/deploy.sh` swaps in the new `.env`, pulls, restarts, checks `/health` for 30s, and **rolls back** to the previous image and `.env` if unhealthy.
+- **Rollback by hand:** re-run the workflow for an earlier commit (Actions → CI/CD → Run workflow on that branch), or on the server: `IMAGE=<old ref> HOST_PORT=<port> docker compose -p <stack> -f /opt/<stack>/compose.yaml up -d`.
+- Workflow logs are public (public repo): nothing in the pipeline prints secrets or container logs.
 
 ## Testing
 

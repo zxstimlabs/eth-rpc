@@ -41,6 +41,9 @@ services:
     env_file: [.env]
     environment:
       REDIS_URL: redis://redis:6379
+      # Client IP comes from nginx's X-Real-IP. Safe only because the port
+      # below is bound to 127.0.0.1, so nothing but the host can connect.
+      TRUST_PROXY: "1"
     # Localhost only; nginx on the host terminates TLS and proxies here.
     ports:
       - "127.0.0.1:${HOST_PORT:-8001}:8000"

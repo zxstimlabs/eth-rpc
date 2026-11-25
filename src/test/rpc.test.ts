@@ -14,8 +14,8 @@
  *
  * Rate-limit counts live in Redis, so these tests need `REDIS_URL` pointing
  * at a disposable Redis. Every window under the rpc limiter's prefix is
- * cleared before each test. (`rpc.handle()` has no server, so every request
- * here shares the "" client key.)
+ * cleared before each test. (`rpc.handle()` has no server, so requests
+ * without an `X-Real-IP` header share the "" client key.)
  */
 
 import {
@@ -268,6 +268,20 @@ describe("rate limiting (Redis-backed)", () => {
     expect(limited.headers.get("ratelimit-remaining")).toBe("0");
     expect(upstreamCalls).toBe(max); // the 429 never reached the upstream
   });
+
+  // Needs TRUST_PROXY=1 at module load (set in deploy/compose.test.yaml and CI).
+  test.if(process.env.TRUST_PROXY === "1")(
+    "each client (X-Real-IP from nginx) gets its own bucket",
+    async () => {
+      const { max } = rpcConfig.rateLimit;
+      for (let i = 0; i < max; i++) {
+        expect((await post({ "x-real-ip": "203.0.113.1" })).status).toBe(200);
+      }
+      expect((await post({ "x-real-ip": "203.0.113.1" })).status).toBe(429);
+      // A different client is unaffected by the first one's usage.
+      expect((await post({ "x-real-ip": "203.0.113.2" })).status).toBe(200);
+    }
+  );
 
   test("fails closed: limiter unavailable → 503 with Retry-After and CORS, no upstream call", async () => {
     const original = rpcRateLimitStore.increment;

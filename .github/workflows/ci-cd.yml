@@ -1,0 +1,187 @@
+# CI/CD for zxstim-rpc
+#
+#   pull request → main/develop   test only
+#   push develop                  test → build image → deploy to "develop"    (stack zxstim-rpc-dev, 127.0.0.1:8002)
+#   push main                     test → build image → deploy to "production" (stack zxstim-rpc,     127.0.0.1:8001)
+#
+# Both deploy to the same server (Tailscale machine zxstim-rpc). Secrets live
+# in the GitHub environment ("develop" | "production"), which only its own
+# branch can use. The runner joins the tailnet with a Tailscale OIDC
+# credential scoped to that environment (tag:ci), so no long-lived secret
+# exists. The access rules let tag:ci reach only tag:server's SSH port, as
+# user "deploy".
+#
+# Third-party actions are pinned to full commit SHAs (version in the comment).
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash # -eo pipefail
+
+env:
+  IMAGE_NAME: ghcr.io/zxstimlabs/eth-rpc
+  BUN_VERSION: 1.4.5
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    services:
+      redis:
+        image: redis:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    env:
+      REDIS_URL: redis://localhost:6379
+      TRUST_PROXY: "1"
+      # Fake upstreams: tests mock fetch. Distinct so routing tests can tell chains apart.
+      ETHEREUM_RPC_URL: http://upstream.invalid/eth
+      ARBITRUM_RPC_URL: http://upstream.invalid/arb
+      BASE_RPC_URL: http://upstream.invalid/base
+      SEPOLIA_RPC_URL: http://upstream.invalid/sep
+      ARBITRUM_SEPOLIA_RPC_URL: http://upstream.invalid/arb-sep
+      BASE_SEPOLIA_RPC_URL: http://upstream.invalid/base-sep
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - run: bun test
+
+  build:
+    name: Build image
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: ref
+        run: echo "image=${IMAGE_NAME}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runtime
+          push: true
+          build-args: BUN_VERSION=${{ env.BUN_VERSION }}
+          tags: |
+            ${{ steps.ref.outputs.image }}
+            ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ github.ref_name }}
+          cache-to: type=gha,mode=max,scope=${{ github.ref_name }}
+
+  deploy:
+    name: Deploy (${{ github.ref_name == 'main' && 'production' || 'develop' }})
+    needs: build
+    if: github.event_name != 'pull_request' && (github.ref_name == 'main' || github.ref_name == 'develop')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: ${{ github.ref_name == 'main' && 'production' || 'develop' }}
+    # One deploy per environment at a time; a newer pending run replaces an older one.
+    concurrency:
+      group: deploy-${{ github.ref_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read # pull the image on the server (token passed via stdin, logged out after)
+      id-token: write # Tailscale OIDC
+    env:
+      DEPLOY_HOST: zxstim-rpc.tail2e11cd.ts.net
+      STACK: ${{ github.ref_name == 'main' && 'zxstim-rpc' || 'zxstim-rpc-dev' }}
+      HOST_PORT: ${{ github.ref_name == 'main' && '8001' || '8002' }}
+      IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Join tailnet (ephemeral, tag:ci)
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        with:
+          oauth-client-id: ${{ vars.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
+          tags: tag:ci
+          ping: ${{ env.DEPLOY_HOST }}
+
+      - name: Trust the server's SSH host key as published by Tailscale
+        run: |
+          ip=$(sudo tailscale ip -4 "$DEPLOY_HOST")
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          sudo tailscale status --json \
+            | jq -r --arg ip "$ip" '.Peer[] | select(.TailscaleIPs | index($ip)) | .sshHostKeys[]? | "\($ip) \(.)"' \
+            > ~/.ssh/known_hosts
+          [ -s ~/.ssh/known_hosts ] || { echo "::error::no SSH host keys published for $DEPLOY_HOST"; exit 1; }
+          echo "DEPLOY_IP=$ip" >> "$GITHUB_ENV"
+          cat > ~/.ssh/config <<EOF
+          Host server
+            HostName $ip
+            User deploy
+            BatchMode yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            ConnectTimeout 20
+          EOF
+
+      - name: Upload compose file and deploy script
+        run: |
+          ssh server "cat > /opt/$STACK/compose.yaml" < deploy/compose.yaml
+          ssh server "cat > /opt/$STACK/deploy.sh && chmod 700 /opt/$STACK/deploy.sh" < deploy/deploy.sh
+
+      - name: Write .env from environment secrets
+        env:
+          ETHEREUM_RPC_URL: ${{ secrets.ETHEREUM_RPC_URL }}
+          ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
+          SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
+          ARBITRUM_SEPOLIA_RPC_URL: ${{ secrets.ARBITRUM_SEPOLIA_RPC_URL }}
+          BASE_SEPOLIA_RPC_URL: ${{ secrets.BASE_SEPOLIA_RPC_URL }}
+        run: |
+          vars="ETHEREUM_RPC_URL ARBITRUM_RPC_URL BASE_RPC_URL SEPOLIA_RPC_URL ARBITRUM_SEPOLIA_RPC_URL BASE_SEPOLIA_RPC_URL"
+          for v in $vars; do
+            [ -n "${!v}" ] || { echo "::error::secret $v is empty in environment ${{ github.ref_name == 'main' && 'production' || 'develop' }}"; exit 1; }
+          done
+          for v in $vars; do printf '%s=%s\n' "$v" "${!v}"; done \
+            | ssh server "umask 077; cat > /opt/$STACK/.env.next"
+
+      - name: Pull, restart, health check (rolls back on failure)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | ssh server "/opt/$STACK/deploy.sh $STACK $HOST_PORT $IMAGE"
+
+      - name: Verify from the server
+        run: ssh server "curl -fsS http://127.0.0.1:$HOST_PORT/health && echo"

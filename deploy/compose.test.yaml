@@ -26,6 +26,7 @@ services:
       target: test
     environment:
       REDIS_URL: redis://redis:6379
+      TRUST_PROXY: "1"
       ETHEREUM_RPC_URL: http://upstream.invalid/eth
       ARBITRUM_RPC_URL: http://upstream.invalid/arb
       BASE_RPC_URL: http://upstream.invalid/base

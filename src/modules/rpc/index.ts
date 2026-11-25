@@ -17,7 +17,11 @@
 import { Elysia } from "elysia";
 import { cors } from "@elysiajs/cors";
 import { rateLimit } from "elysia-rate-limit";
-import { hashClientIp } from "../../lib/client-id";
+import {
+  clientIp,
+  getListeningServer,
+  hashClientIp,
+} from "../../lib/client-id";
 import { redis } from "../../lib/redis";
 import {
   RateLimiterUnavailableError,
@@ -54,6 +58,13 @@ const BASE_RPC_URL = requireEnv("BASE_RPC_URL");
 const SEPOLIA_RPC_URL = requireEnv("SEPOLIA_RPC_URL");
 const ARBITRUM_SEPOLIA_RPC_URL = requireEnv("ARBITRUM_SEPOLIA_RPC_URL");
 const BASE_SEPOLIA_RPC_URL = requireEnv("BASE_SEPOLIA_RPC_URL");
+
+/**
+ * `TRUST_PROXY=1` → take the client IP from `X-Real-IP` (set by our nginx).
+ * Only safe when the app is reachable solely through that proxy — see
+ * `clientIp()`. deploy/compose.yaml sets it; the port is bound to 127.0.0.1.
+ */
+const TRUST_PROXY = process.env.TRUST_PROXY === "1";
 
 /**
  * Rate-limit counts live in Redis (shared `redis` client). Fails closed:
@@ -96,16 +107,20 @@ export const rpc = new Elysia({ prefix: "/rpc" })
       // Counts in Redis instead of the plugin's in-process LRU.
       context: rpcRateLimitStore,
 
+      // The plugin looks up the server on the app it's mounted on — this
+      // sub-app, which has none (only the root app that calls .listen()
+      // does). Without this, every client got the same "" key: one shared
+      // bucket for everyone. src/index.ts registers the real server.
+      injectServer: getListeningServer,
+
       // Custom key generator. Replaces the plugin's default, which:
-      //   (a) uses the raw IP as the LRU key (we don't want IPs in RAM), and
+      //   (a) uses the raw IP as the key (we don't want IPs stored), and
       //   (b) emits `console.warn` when IP detection fails (we want zero logs).
       //
-      // `server.requestIP(request)` returns the direct TCP peer. If this
-      // service is ever deployed behind a load balancer/CDN, every
-      // customer will share the LB's IP — at that point, read
-      // `x-forwarded-for` here instead (and trust it only from the LB).
+      // Behind nginx + Docker the TCP peer is the proxy, so with
+      // TRUST_PROXY the nginx-set `X-Real-IP` is used instead (see clientIp).
       generator: (request, server) => {
-        const ip = server?.requestIP(request)?.address;
+        const ip = clientIp(request, server, TRUST_PROXY);
         // Empty string still works as a key: all unidentifiable clients
         // share one bucket, which is safe (they self-throttle together).
         return ip ? hashClientIp(ip) : "";
