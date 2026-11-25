@@ -18,6 +18,11 @@ import { Elysia } from "elysia";
 import { cors } from "@elysiajs/cors";
 import { rateLimit } from "elysia-rate-limit";
 import { hashClientIp } from "../../lib/client-id";
+import { redis } from "../../lib/redis";
+import {
+  RateLimiterUnavailableError,
+  RedisRateLimitContext,
+} from "../../lib/redis-rate-limit";
 import { rpcConfig } from "../../config/rpc";
 import { RpcService } from "./service";
 
@@ -50,6 +55,16 @@ const SEPOLIA_RPC_URL = requireEnv("SEPOLIA_RPC_URL");
 const ARBITRUM_SEPOLIA_RPC_URL = requireEnv("ARBITRUM_SEPOLIA_RPC_URL");
 const BASE_SEPOLIA_RPC_URL = requireEnv("BASE_SEPOLIA_RPC_URL");
 
+/**
+ * Rate-limit counts live in Redis (shared `redis` client). Fails closed:
+ * if Redis can't answer, requests get a 503 (see `.onError` below) rather
+ * than being served uncounted. Exported so tests can reset windows.
+ */
+export const rpcRateLimitStore = new RedisRateLimitContext(redis, {
+  prefix: rpcConfig.rateLimit.redisKeyPrefix,
+  timeoutMs: rpcConfig.rateLimit.redisTimeoutMs,
+});
+
 // --- Controller ------------------------------------------------------------
 
 export const rpc = new Elysia({ prefix: "/rpc" })
@@ -78,6 +93,9 @@ export const rpc = new Elysia({ prefix: "/rpc" })
       // throughput for free.
       countFailedRequest: true,
 
+      // Counts in Redis instead of the plugin's in-process LRU.
+      context: rpcRateLimitStore,
+
       // Custom key generator. Replaces the plugin's default, which:
       //   (a) uses the raw IP as the LRU key (we don't want IPs in RAM), and
       //   (b) emits `console.warn` when IP detection fails (we want zero logs).
@@ -94,6 +112,18 @@ export const rpc = new Elysia({ prefix: "/rpc" })
       },
     })
   )
+  // Fail closed: when the limiter can't reach Redis, refuse with a 503
+  // instead of serving uncounted traffic. Setting `set.status`/headers
+  // (rather than returning a bare Response) keeps the CORS headers, so
+  // browsers can read the 503. Nothing is logged. Other errors fall
+  // through to Elysia's default handling.
+  .onError(({ error, set }) => {
+    if (error instanceof RateLimiterUnavailableError) {
+      set.status = 503;
+      set.headers["retry-after"] = String(rpcConfig.rateLimit.unavailableRetryAfterSec);
+      return "rate limiter unavailable";
+    }
+  })
   // `.all()` accepts any HTTP method so each endpoint behaves as a
   // drop-in for the upstream RPC URL. JSON-RPC is POST in practice, but
   // being permissive costs nothing and avoids surprising library

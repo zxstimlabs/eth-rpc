@@ -26,5 +26,16 @@ export const rpcConfig = {
   rateLimit: {
     max: 200,
     durationMs: 60_000,
+
+    /** Namespace for this limiter's keys in Redis. */
+    redisKeyPrefix: "zxstim-rpc:rl:rpc:",
+    /**
+     * Redis must answer within this many ms, or the request is refused
+     * (503). Redis on the same host answers in well under 1 ms; this only
+     * trips when Redis is stalled.
+     */
+    redisTimeoutMs: 500,
+    /** `Retry-After` (seconds) sent with the 503 when Redis is unavailable. */
+    unavailableRetryAfterSec: 5,
   },
 };

@@ -17,7 +17,7 @@ Every endpoint is designed to be called directly from a browser: open CORS, per-
 
 ```bash
 bun install
-cp .env.example .env.local   # then fill in all six *_RPC_URL values
+cp .env.example .env.local   # then fill in all six *_RPC_URL values (and REDIS_URL)
 bun run dev
 ```
 
@@ -84,18 +84,21 @@ Point viem / ethers / web3.js at that URL instead of your Alchemy/Infura/etc. UR
 
 ## Rate limiting
 
-The rpc module uses [`elysia-rate-limit`](https://github.com/rayriffy/elysia-rate-limit), with the budget set in `src/config/rpc.ts` (currently 200 requests per rolling 60s per client, shared across all chains).
+The rpc module uses [`elysia-rate-limit`](https://github.com/rayriffy/elysia-rate-limit), with the budget set in `src/config/rpc.ts` (currently 200 requests per fixed 60s window per client, shared across all chains). **Counts live in Redis** (`src/lib/redis-rate-limit.ts`, Bun's built-in client), not in process memory.
 
 - **`countFailedRequest: true`** — 4xx/5xx responses still consume the budget, so an attacker cannot spam deliberately-erroring calls for free.
-- **`scoping: "scoped"`** — the limiter's hooks apply only to the rpc module; `/` is never throttled.
-- **Client key** — the custom generator (see `src/lib/client-id.ts`) returns `sha256(salt || ip)` as a hex string. The plugin's default LRU stores that digest, not the IP. Unidentifiable clients (no peer IP available) share one bucket under the empty-string key.
+- **`scoping: "scoped"`** — the limiter's hooks apply only to the rpc module; `/` and `/health` are never throttled.
+- **Client key** — the custom generator (see `src/lib/client-id.ts`) returns `sha256(salt || ip)` as a hex string; Redis stores that digest (under `zxstim-rpc:rl:rpc:`), never the IP. Each key expires with its window. Unidentifiable clients share one bucket under the empty-string key.
+- **Fails closed** — if Redis is down, stalled (> 500 ms) or erroring, `/rpc/*` answers **503** with `Retry-After: 5` (CORS headers intact) instead of serving uncounted traffic. The server also refuses to start without Redis. `GET /health` returns 200 only while Redis answers.
+- **Redis config** (`deploy/compose.yaml`) — persistence off (`--save ""`, no AOF), 64 MB cap, no published port: counters exist only in memory, only for their window.
+- The salt is still per-process, so counts reset when the app restarts (as before).
 
 ## Privacy posture
 
 The goal across the whole app is: **the upstream RPC provider cannot distinguish customers, and this server never stores customer information.** Concretely:
 
 - **No logging.** No access logs, no request/response bodies written anywhere. The only log is a single startup line in `src/index.ts`.
-- **No persistence.** Nothing is written to disk — no request bodies, no cookies, no per-client rows.
+- **No persistence.** Nothing is written to disk — no request bodies, no cookies, no per-client rows. Redis holds only salted-hash rate-limit counters, in memory, each expiring with its 60s window.
 - **IPs are not stored in plaintext.** The rate-limit LRU stores salted hashes only; the salt is in-process memory and dies with the process.
 - **Customer headers are dropped, not passed through.** `RpcService.proxy` uses an allowlist (not a denylist), so new browser fingerprinting headers are blocked by default.
 - **User-Agent is overwritten.** Every outbound request carries `zxstim-rpc/1.0` regardless of what the customer sent.

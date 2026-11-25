@@ -11,16 +11,33 @@
  * `afterEach` restores the original fetch so the mock cannot leak into
  * other test files (Bun may run test files in separate workers, but we
  * don't rely on that).
+ *
+ * Rate-limit counts live in Redis, so these tests need `REDIS_URL` pointing
+ * at a disposable Redis. Every window under the rpc limiter's prefix is
+ * cleared before each test. (`rpc.handle()` has no server, so every request
+ * here shares the "" client key.)
  */
 
 import {
   afterEach,
+  beforeAll,
   beforeEach,
   describe,
   expect,
   test,
 } from "bun:test";
-import { rpc } from "../modules/rpc";
+import { rpc, rpcRateLimitStore } from "../modules/rpc";
+import { redis } from "../lib/redis";
+import { RateLimiterUnavailableError } from "../lib/redis-rate-limit";
+import { rpcConfig } from "../config/rpc";
+
+beforeAll(async () => {
+  await redis.connect();
+});
+
+beforeEach(async () => {
+  await rpcRateLimitStore.reset();
+});
 
 type FetchArgs = { url: string; init: RequestInit | undefined };
 
@@ -208,5 +225,67 @@ describe("chain routing", () => {
 
     expect(res.status).toBe(200);
     expect(upstreamUrl).toBe(process.env[envVar]!);
+  });
+});
+
+describe("rate limiting (Redis-backed)", () => {
+  const originalFetch = globalThis.fetch;
+  let upstreamCalls: number;
+
+  const post = (headers: Record<string, string> = {}) =>
+    rpc.handle(
+      new Request("http://localhost/rpc/ethereum", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: "{}",
+      })
+    );
+
+  beforeEach(() => {
+    upstreamCalls = 0;
+    globalThis.fetch = (async () => {
+      upstreamCalls++;
+      return new Response(UPSTREAM_RESPONSE_BODY, { status: 200 });
+    }) as unknown as typeof globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test("allows `max` requests per window, then answers 429 without proxying", async () => {
+    const { max } = rpcConfig.rateLimit;
+
+    for (let i = 0; i < max; i++) {
+      const res = await post();
+      expect(res.status).toBe(200);
+    }
+    expect(upstreamCalls).toBe(max);
+
+    const limited = await post();
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("retry-after")).toBeTruthy();
+    expect(limited.headers.get("ratelimit-remaining")).toBe("0");
+    expect(upstreamCalls).toBe(max); // the 429 never reached the upstream
+  });
+
+  test("fails closed: limiter unavailable → 503 with Retry-After and CORS, no upstream call", async () => {
+    const original = rpcRateLimitStore.increment;
+    rpcRateLimitStore.increment = async () => {
+      throw new RateLimiterUnavailableError();
+    };
+    try {
+      const res = await post({ origin: "https://app.example.com" });
+
+      expect(res.status).toBe(503);
+      expect(await res.text()).toBe("rate limiter unavailable");
+      expect(res.headers.get("retry-after")).toBe(
+        String(rpcConfig.rateLimit.unavailableRetryAfterSec)
+      );
+      expect(res.headers.get("access-control-allow-origin")).toBeTruthy();
+      expect(upstreamCalls).toBe(0);
+    } finally {
+      rpcRateLimitStore.increment = original;
+    }
   });
 });

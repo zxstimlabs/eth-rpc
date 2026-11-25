@@ -1,0 +1,62 @@
+# zxstim-rpc: the app plus its private Redis (rate-limit counters).
+#
+#   Run a published image:  IMAGE=ghcr.io/zxstimlabs/eth-rpc:<tag> docker compose -f deploy/compose.yaml up -d
+#   Build from this checkout: docker compose -f deploy/compose.yaml up -d --build
+#   Second copy side by side: add `-p <other-name>` and HOST_PORT=<other-port>
+#
+# Secrets (*_RPC_URL) come from deploy/.env (gitignored, mode 600), never
+# from the image.
+
+name: zxstim-rpc
+
+services:
+  redis:
+    image: redis:8-alpine
+    # Counters only: memory, never disk. Bounded, and evicts keys closest
+    # to expiry first if it ever fills.
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 64mb
+      - --maxmemory-policy
+      - volatile-ttl
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+    # No `ports:` — only reachable from this stack's network.
+    networks: [backend]
+
+  app:
+    image: ${IMAGE:-zxstim-rpc:local}
+    build:
+      context: ..
+      target: runtime
+    env_file: [.env]
+    environment:
+      REDIS_URL: redis://redis:6379
+    # Localhost only; nginx on the host terminates TLS and proxies here.
+    ports:
+      - "127.0.0.1:${HOST_PORT:-8001}:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    # The app logs only its startup line; cap the file anyway.
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
+    networks: [backend]
+
+networks:
+  backend: {}

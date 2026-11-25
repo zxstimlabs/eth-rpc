@@ -20,11 +20,12 @@ bun run build                            # compile to a standalone binary (./bui
 - **Single test file:** `bun --env-file=.env.local test src/test/rpc.test.ts`
 - **By test name:** `bun --env-file=.env.local test -t "strips headers"`
 - `bun run test` passes `--env-file=.env.local` explicitly because **`bun test` deliberately ignores `.env.local`**. The dev server auto-loads it, but `bun test` does not — always pass `--env-file=.env.local` when running tests directly.
+- Tests need a disposable **Redis** (`REDIS_URL`) — they reset counters and briefly pause Redis writes, so never point them at a Redis that serves traffic. Run them in Docker with their own Redis: `docker compose -f deploy/compose.test.yaml run --rm --build test` (then `... down`). The user prefers tests run **on the server box**, not this Mac.
 - Tests never hit a real upstream (`rpc.test.ts` mocks `globalThis.fetch`), but the RPC module still needs all six `*_RPC_URL` vars set to load. Any values work, but keep them distinct so the per-chain routing test can catch a route wired to the wrong upstream.
 
 ### Environment
 
-Copy `.env.example` → `.env.local` and fill in all keys. The rpc module reads its env vars **once at module load and throws if any are missing** (fail-fast at boot, not at first request). A missing key means the whole server refuses to start — this is intentional. Required: `ETHEREUM_RPC_URL`, `ARBITRUM_RPC_URL`, `BASE_RPC_URL`, `SEPOLIA_RPC_URL`, `ARBITRUM_SEPOLIA_RPC_URL`, `BASE_SEPOLIA_RPC_URL`.
+Copy `.env.example` → `.env.local` and fill in all keys. The rpc module reads its env vars **once at module load and throws if any are missing** (fail-fast at boot, not at first request). A missing key means the whole server refuses to start — this is intentional. Required: `REDIS_URL`, `ETHEREUM_RPC_URL`, `ARBITRUM_RPC_URL`, `BASE_RPC_URL`, `SEPOLIA_RPC_URL`, `ARBITRUM_SEPOLIA_RPC_URL`, `BASE_SEPOLIA_RPC_URL`.
 
 ## Architecture
 
@@ -41,12 +42,14 @@ Every feature lives in `src/modules/<feature>/` (currently only `rpc`):
 Copy `src/modules/rpc/index.ts` when adding a module:
 - `cors({ origin: true, credentials: false })` registered **before** `rateLimit` (so CORS preflights short-circuit and don't consume rate-limit budget).
 - `rateLimit` with `scoping: "scoped"` (confines the limiter to that module — without it the plugin defaults to `"global"` and throttles `/` too), `countFailedRequest: true` (4xx/5xx still spend budget), and a custom `generator` that keys on `hashClientIp(ip)` — never the raw IP.
-- **`hashClientIp`** (`src/lib/client-id.ts`) = `sha256(per-process-random-salt || ip)`. The salt lives only in memory and dies with the process, so the rate-limit store holds opaque digests, not IPs. Shared in `lib/` so any future module reuses it rather than duplicating it.
+- **`hashClientIp`** (`src/lib/client-id.ts`) = `sha256(per-process-random-salt || ip)`. The salt lives only in memory and dies with the process, so the rate-limit store (Redis) holds opaque digests, not IPs.
+- **Rate-limit counts live in Redis** via `RedisRateLimitContext` (`src/lib/redis-rate-limit.ts`, implements the plugin's `context` interface; one atomic Lua `EVAL` per request; fixed window). It **fails closed**: Redis down/slow/erroring → `RateLimiterUnavailableError` → the controller's `.onError` returns **503** + `Retry-After` (via `set`, so CORS headers survive). The shared client (`src/lib/redis.ts`) has `enableOfflineQueue: false` so an outage fails fast instead of hanging requests. `src/index.ts` awaits `connectRedis()` before `.listen()`; `GET /health` is 200 only while Redis answers PING. Shared in `lib/` so any future module reuses it rather than duplicating it.
 
 ### Directory roles
 
 - `src/config/<feature>.ts` — server-side defaults (rate-limit budgets, timeouts). **Applied server-side and never accepted from the client.**
-- `src/lib/` — cross-module helpers (`client-id.ts`).
+- `src/lib/` — cross-module helpers (`client-id.ts`, `redis.ts`, `redis-rate-limit.ts`).
+- `Dockerfile` (deps → test → build → distroless `runtime`), `deploy/compose.yaml` (app + Redis, app on `127.0.0.1:${HOST_PORT:-8001}`), `deploy/compose.test.yaml` (tests + throwaway Redis).
 
 ### The `rpc` module
 
@@ -54,8 +57,8 @@ Copy `src/modules/rpc/index.ts` when adding a module:
 
 ## Privacy posture (do not regress)
 
-- **No request logging.** The only `console.log` is the startup line. Don't add access logs, request/response body logging, or per-customer APM attributes.
-- **No client PII persisted.** No cookies, no IPs in plaintext (rate-limit store holds salted hashes only). The server currently writes nothing to disk at all.
+- **No request logging.** The only `console.log` is the startup line. Don't add logging to the Redis/rate-limit failure paths either. Don't add access logs, request/response body logging, or per-customer APM attributes.
+- **No client PII persisted.** No cookies, no IPs in plaintext (rate-limit store holds salted hashes only). Nothing is written to disk: Redis runs with persistence off and every counter expires with its window.
 - **Header allowlist, not denylist** for the RPC proxy; fixed outbound `User-Agent`.
 - **Reverse-proxy caveat:** rate-limit keys on `server.requestIP()` (direct TCP peer). Behind an LB/CDN every client collapses to one bucket — the fix is to read a trusted `x-forwarded-for` in the module's `generator`, but only once the deployment actually sits behind a trusted proxy.
 
