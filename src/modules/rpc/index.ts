@@ -2,8 +2,11 @@
  * RPC Module (controller)
  * -----------------------
  * Exposes public `/rpc/*` endpoints that proxy JSON-RPC requests to
- * blockchain providers. Each supported chain has a path (`/rpc/ethereum`,
- * `/rpc/arbitrum`, `/rpc/base`, …) backed by its own upstream URL.
+ * blockchain providers. Each supported chain has a path backed by its own
+ * upstream URL:
+ *
+ *   mainnets: `/rpc/ethereum`, `/rpc/arbitrum`, `/rpc/base`
+ *   testnets: `/rpc/sepolia`, `/rpc/arbitrum-sepolia`, `/rpc/base-sepolia`
  *
  * This file is the Elysia "controller" for the feature: it wires together
  * CORS, per-client rate limiting, and the RpcService (which does the actual
@@ -26,22 +29,26 @@ import { RpcService } from "./service";
  * to start without any of them — failing fast here is better than
  * returning 500s at runtime when a particular chain's path is hit.
  *
- * When you add a new chain: add its env var here, add the null check,
- * and add a matching `.all("/{chain}", ...)` route below.
+ * When you add a new chain: add a `requireEnv` line here and a matching
+ * `.all("/{chain}", ...)` route below.
  */
-const ETHEREUM_RPC_URL = process.env.ETHEREUM_RPC_URL;
-const ARBITRUM_RPC_URL = process.env.ARBITRUM_RPC_URL;
-const BASE_RPC_URL = process.env.BASE_RPC_URL;
+const requireEnv = (name: string): string => {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`${name} is not set`);
+  }
+  return value;
+};
 
-if (!ETHEREUM_RPC_URL) {
-  throw new Error("ETHEREUM_RPC_URL is not set");
-}
-if (!ARBITRUM_RPC_URL) {
-  throw new Error("ARBITRUM_RPC_URL is not set");
-}
-if (!BASE_RPC_URL) {
-  throw new Error("BASE_RPC_URL is not set");
-}
+// Mainnets
+const ETHEREUM_RPC_URL = requireEnv("ETHEREUM_RPC_URL");
+const ARBITRUM_RPC_URL = requireEnv("ARBITRUM_RPC_URL");
+const BASE_RPC_URL = requireEnv("BASE_RPC_URL");
+
+// Testnets (Sepolia-based)
+const SEPOLIA_RPC_URL = requireEnv("SEPOLIA_RPC_URL");
+const ARBITRUM_SEPOLIA_RPC_URL = requireEnv("ARBITRUM_SEPOLIA_RPC_URL");
+const BASE_SEPOLIA_RPC_URL = requireEnv("BASE_SEPOLIA_RPC_URL");
 
 // --- Controller ------------------------------------------------------------
 
@@ -91,10 +98,21 @@ export const rpc = new Elysia({ prefix: "/rpc" })
   // drop-in for the upstream RPC URL. JSON-RPC is POST in practice, but
   // being permissive costs nothing and avoids surprising library
   // behaviour. Final paths are `/rpc/{chain}` (prefix + route).
+  //
+  // All chains (mainnet and testnet) share the one rate-limit budget above.
   .all("/ethereum", ({ request }) =>
     RpcService.proxy(request, ETHEREUM_RPC_URL)
   )
   .all("/arbitrum", ({ request }) =>
     RpcService.proxy(request, ARBITRUM_RPC_URL)
   )
-  .all("/base", ({ request }) => RpcService.proxy(request, BASE_RPC_URL));
+  .all("/base", ({ request }) => RpcService.proxy(request, BASE_RPC_URL))
+  .all("/sepolia", ({ request }) =>
+    RpcService.proxy(request, SEPOLIA_RPC_URL)
+  )
+  .all("/arbitrum-sepolia", ({ request }) =>
+    RpcService.proxy(request, ARBITRUM_SEPOLIA_RPC_URL)
+  )
+  .all("/base-sepolia", ({ request }) =>
+    RpcService.proxy(request, BASE_SEPOLIA_RPC_URL)
+  );

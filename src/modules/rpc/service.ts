@@ -31,7 +31,7 @@ const FORWARD_HEADERS = new Set(["content-type", "accept"]);
  * the browser sent. This makes all outbound traffic look identical to the
  * provider — they cannot distinguish one of our customers from another.
  */
-const PROXY_USER_AGENT = "unitmetal-api/1.0";
+const PROXY_USER_AGENT = "zxstim-rpc/1.0";
 
 export abstract class RpcService {
   /**

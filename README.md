@@ -1,24 +1,29 @@
-# UnitMetal API
+# zxstim-rpc
 
-An [Elysia](https://elysiajs.com) / [Bun](https://bun.sh) backend that exposes a set of public, browser-callable endpoints for a crypto frontend:
+An [Elysia](https://elysiajs.com) / [Bun](https://bun.sh) backend that exposes privacy-preserving, browser-callable JSON-RPC proxies for a crypto frontend:
 
-- **`POST /rpc/{ethereum,arbitrum,base}`** — privacy-preserving JSON-RPC proxies to the upstream providers.
-- **`GET /prices/ethereum`** — on-chain USD prices for every token in the bundled token list, fetched in a single multicall.
-- **`POST /swapagg/ethereum`** — best-effort swap routes fanned out across KyberSwap, 0x, and Uniswap in one round-trip.
-- **`GET /markets`** — a cached CoinGecko market snapshot, refreshed by a background cron job.
-- **`GET /tokens/{ethereum,arbitrum,base}`** — the curated UnitMetal token list, filtered per chain.
+| Chain            | Path                    | Env var                    |
+| ---------------- | ----------------------- | -------------------------- |
+| Ethereum         | `/rpc/ethereum`         | `ETHEREUM_RPC_URL`         |
+| Arbitrum One     | `/rpc/arbitrum`         | `ARBITRUM_RPC_URL`         |
+| Base             | `/rpc/base`             | `BASE_RPC_URL`             |
+| Sepolia          | `/rpc/sepolia`          | `SEPOLIA_RPC_URL`          |
+| Arbitrum Sepolia | `/rpc/arbitrum-sepolia` | `ARBITRUM_SEPOLIA_RPC_URL` |
+| Base Sepolia     | `/rpc/base-sepolia`     | `BASE_SEPOLIA_RPC_URL`     |
 
-Every endpoint is designed to be called directly from a browser: open CORS, per-client rate limiting, zero request logging, and no persistence of client data. The only thing persisted server-side is the cached `/markets` snapshot — market data, never client data.
+Every endpoint is designed to be called directly from a browser: open CORS, per-client rate limiting, zero request logging, and no persistence of client data. The server writes nothing to disk.
 
 ## Getting Started
 
 ```bash
 bun install
-cp .env.example .env.local   # then fill in ETHEREUM_RPC_URL
+cp .env.example .env.local   # then fill in all six *_RPC_URL values
 bun run dev
 ```
 
 Open http://localhost:8000/ with your browser to see the result.
+
+All six RPC URLs (mainnet and testnet) are required — the RPC module reads them once at load and the server refuses to start if any is missing.
 
 ## Scripts
 
@@ -26,166 +31,80 @@ Open http://localhost:8000/ with your browser to see the result.
 | ---------------- | ------------------------------------------------------------- |
 | `bun run dev`    | Start the dev server on `:8000` with file-watch reload.       |
 | `bun run test`   | Run the Bun test suite (`src/test/**/*.test.ts`).             |
+| `bun run build`  | Compile a standalone binary to `./build/zxstim-rpc`.       |
 
 `bun run test` loads `.env.local` explicitly via `--env-file`, because `bun test` deliberately ignores `.env.local` by default.
-
-## Database
-
-SQLite via `bun:sqlite` (built into Bun, no native addon to compile), with [Drizzle ORM](https://orm.drizzle.team) as the schema/query layer.
-
-- **DB file** — defaults to `./data.db` at the process cwd. Override with `DATABASE_PATH` in `.env.local`. The `*.db*` family is gitignored.
-- **Connection** — `src/lib/db.ts` opens one process-wide handle and enables WAL so route reads don't block the cron writer.
-- **Schemas** — colocated with each feature module: `src/modules/<feature>/schema.ts`. `drizzle.config.ts` globs `src/modules/*/schema.ts` so adding a new feature picks up automatically.
-- **Applying schema changes** (no scripts added to `package.json` yet — run drizzle-kit directly):
-
-  ```bash
-  bun drizzle-kit push       # dev: push current schema straight to the DB
-  bun drizzle-kit generate   # produce a versioned migration in ./drizzle
-  bun drizzle-kit migrate    # apply pending migrations from ./drizzle
-  ```
-
-  Use `push` for local iteration; switch to `generate` + `migrate` once the schema is something you want to version.
 
 ## Project Structure
 
 ```
 src/
-├── index.ts                      # Root Elysia app — mounts every module, warms the markets cache, listens on :8000
-├── config/                       # Per-feature server-side defaults (rate limits, fees, timeouts). Never client-supplied.
-│   ├── rpc.ts
-│   ├── swapagg.ts                # Per-aggregator fee policy, pinned to the treasury address
-│   ├── markets.ts                # Curated CoinGecko coin list + refresh cadence
-│   └── tokens.ts
-├── data/                         # Static-ish JSON lists, imported once at module load
-│   ├── uniswap-token-list.json   # Source for the /tokens endpoints (refresh via script)
-│   ├── token-list.json           # Ethereum token list used by /prices
-│   └── *-token-list.json         # Per-chain lists produced by create-token-lists.ts
+├── index.ts              # Root Elysia app — mounts the rpc module, listens on :8000
+├── config/
+│   └── rpc.ts            # Server-side rate-limit budget. Never client-supplied.
 ├── lib/
-│   ├── db.ts                     # Process-wide bun:sqlite handle (WAL) + Drizzle
-│   ├── client-id.ts              # Salted SHA-256 hash of client IP (shared by every rate limiter)
-│   ├── constants.ts              # On-chain addresses (CheckTheChain oracle, UnitMetal treasury)
-│   ├── abis/
-│   │   └── check-the-chain-abi.ts
-│   └── swap/
-│       ├── um-swap.ts            # umSwap: umbrella SDK that fans out to all aggregators
-│       └── sdks/                 # Per-provider clients: kyberswap, zerox, uniswap
-├── modules/                      # Feature modules — one controller (index.ts) + service (service.ts) each
-│   ├── rpc/                      # Header-sanitizing JSON-RPC proxy
-│   ├── prices/                   # viem multicall against CheckTheChain
-│   ├── swapagg/                  # Swap-route fan-out over umSwap
-│   ├── markets/                  # Cached CoinGecko snapshot (index.ts owns the cron; schema.ts is the table)
-│   └── tokens/                   # Chain-filtered token list with bridge expansion
-├── script/                       # One-off runners: `bun run src/script/<name>.ts`
-│   ├── migrate.ts                # Applies ./drizzle migrations via bun:sqlite (works inside the compiled binary)
-│   ├── uniswap-token-list.ts     # Refresh data/uniswap-token-list.json
-│   ├── create-token-lists.ts     # Build per-chain token lists from CoinGecko
-│   └── fetch-coingecko-markets.ts
-├── test/                         # Bun tests (root, rpc, prices, swapagg, tokens)
-└── types/                        # Shared response types (prices, swapagg, tokens)
+│   └── client-id.ts      # Salted SHA-256 hash of client IP (rate-limit key)
+├── modules/
+│   └── rpc/              # Header-sanitizing JSON-RPC proxy (controller + service)
+└── test/                 # Bun tests (root, rpc)
 ```
 
 ### Architecture
 
 The app follows Elysia's recommended **feature-based module** pattern ([MVC guide](https://elysiajs.com/patterns/mvc.html)): each feature lives under `src/modules/<feature>/` with a controller (`index.ts`) and a service (`service.ts`).
 
-- **Controller (`index.ts`)** — an Elysia instance that owns the prefix, mounts plugins (`@elysiajs/cors`, `elysia-rate-limit`, and `@elysia/cron` where needed), and registers routes. Route handlers are thin wrappers that delegate to the service.
-- **Service (`service.ts`)** — an abstract class of static methods with no Elysia dependency. All business logic (proxying bytes, calling viem, querying SQLite) lives here, which makes the service trivial to unit-test without spinning up an HTTP server.
-- **Root app (`src/index.ts`)** — imports each module and mounts it via `.use(module)`. Adding a new feature = add a new folder under `modules/` and one `.use()` call. It also awaits one `MarketsService.refreshMarkets()` before `.listen()` so `/markets` isn't empty during the window before the first cron tick.
-- **Per-feature config (`src/config/`)** — server-side defaults (rate-limit budgets, swap fee policy, timeouts) kept out of the controllers. These are applied server-side and never accepted from the client, so fee/policy can't be tampered with.
-- **Shared libraries (`src/lib/`)** — cross-module helpers: the SQLite/Drizzle handle (`db.ts`), the client-id hasher (`client-id.ts`), on-chain constants, and the swap SDK.
-- **Swap aggregation (`src/lib/swap/`)** — `umSwap.getSwap(chain, req)` fans out to KyberSwap, 0x, and Uniswap in parallel via `Promise.allSettled`, normalizes each response, and returns them keyed by aggregator. It lives in `lib/` (not `modules/`) so non-HTTP callers can reuse it; the `swapagg` module is just one consumer.
+- **Controller (`index.ts`)** — an Elysia instance that owns the prefix, mounts plugins (`@elysiajs/cors`, `elysia-rate-limit`), and registers routes. Route handlers are thin wrappers that delegate to the service.
+- **Service (`service.ts`)** — an abstract class of static methods with no Elysia dependency, which makes it trivial to unit-test without spinning up an HTTP server.
+- **Root app (`src/index.ts`)** — imports each module and mounts it via `.use(module)`. Adding a new feature = add a new folder under `modules/` and one `.use()` call.
+- **Per-feature config (`src/config/`)** — server-side defaults (rate-limit budgets, timeouts) kept out of the controllers. These are applied server-side and never accepted from the client.
 
-**Privacy primitives are deliberately shared, not duplicated.** `src/lib/client-id.ts` exports `hashClientIp(ip)`: a SHA-256 over a process-lifetime random salt plus the IP. Both rate limiters call it, so the in-memory LRU stores only opaque hex digests. The salt never leaves the process, so a memory dump of the rate-limit cache cannot be reversed back to IPs without also capturing the salt at the same moment.
+**Privacy primitives live in `src/lib/`.** `client-id.ts` exports `hashClientIp(ip)`: a SHA-256 over a process-lifetime random salt plus the IP. The rate limiter calls it, so the in-memory LRU stores only opaque hex digests. The salt never leaves the process, so a memory dump of the rate-limit cache cannot be reversed back to IPs without also capturing the salt at the same moment.
 
 ## Endpoints
 
-### `POST /rpc/ethereum` — Ethereum RPC proxy
+### `POST /rpc/{chain}` — JSON-RPC proxy
 
-Drop-in replacement for `ETHEREUM_RPC_URL` in a browser frontend. Forwards the request body byte-for-byte to the upstream and streams the response back.
+Drop-in replacement for the chain's upstream RPC URL in a browser frontend. Forwards the request body byte-for-byte to the upstream and streams the response back. `{chain}` is one of `ethereum`, `arbitrum`, `base`, `sepolia`, `arbitrum-sepolia`, `base-sepolia`.
 
 **Usage:**
 ```
 http://localhost:8000/rpc/ethereum
+http://localhost:8000/rpc/base-sepolia
 ```
 Point viem / ethers / web3.js at that URL instead of your Alchemy/Infura/etc. URL.
 
 **What the upstream provider sees:**
 - This server's IP (not the end-user's).
-- A fixed `User-Agent: unitmetal-api/1.0` — every request looks identical, so customers cannot be distinguished by browser fingerprint.
+- A fixed `User-Agent: zxstim-rpc/1.0` — every request looks identical, so customers cannot be distinguished by browser fingerprint.
 - `content-type: application/json` and `accept` from the client; everything else (`user-agent`, `accept-language`, `sec-ch-ua-*`, `sec-fetch-*`, `referer`, `origin`, `cookie`, `x-forwarded-*`, `dnt`, etc.) is stripped by `RpcService.proxy`.
 
 **CORS:** `Access-Control-Allow-Origin: *`, credentials off. `OPTIONS` preflights are short-circuited by `@elysiajs/cors` and never proxied upstream.
 
-### `GET /prices/ethereum` — bulk token prices
-
-Returns USD prices for every Ethereum-mainnet token in `src/data/token-list.json` in a single batched on-chain call.
-
-**Example response (trimmed):**
-```json
-[
-  { "chainId": 1, "address": "0x0000000000000000000000000000000000000000", "price": "2345.086344" },
-  { "chainId": 1, "address": "0x111111111117dC0aa78b770fA6A738034120C302", "price": "0.09563" },
-  { "chainId": 1, "address": "0x3E5A19c91266aD8cE2477B91585d1856B84062dF", "price": null },
-  ...
-]
-```
-
-**Response shape** — see `src/types/prices.ts`:
-```ts
-type TokenPrice = {
-  chainId: number;
-  address: string;
-  price: string | null;   // decimal USD string from CheckTheChain, or null if the call failed
-};
-type PricesResponse = TokenPrice[];
-```
-
-The response is deliberately minimal: the frontend is expected to already hold the full token list (name, symbol, decimals, logoURI) and only needs the price keyed by `(chainId, address)`. One entry per token, same order as `token-list.json`.
-
-**Native ETH** is reported at the zero address (Uniswap convention). Internally `PricesService` substitutes WETH (`0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2`) for the price lookup, since CheckTheChain cannot price the zero address — the client still receives `address: "0x0000…0000"`.
-
-**How it works:**
-- `PricesService.getEthereumPrices()` builds one `checkPrice(address)` call per token and sends them all through `publicClient.multicall` (viem), which aggregates them into a single `eth_call` to [Multicall3](https://www.multicall3.com/).
-- `allowFailure: true` so a token without a reachable Uniswap pool returns `price: null` instead of killing the whole batch.
-- [CheckTheChain](https://etherscan.io/address/0x0000000000cDC1F8d393415455E382c30FBc0a84) is the on-chain price oracle that quotes each token against USDC via Uniswap V3.
-- Nothing is cached server-side — each HTTP hit triggers a fresh on-chain read. (The frontend should debounce and cache as appropriate.)
-
-**ABI note:** `src/modules/prices/service.ts` ships a minimal single-overload ABI for `checkPrice`. The full CheckTheChain ABI in `src/lib/abis/check-the-chain-abi.ts` declares both `checkPrice(address)` and `checkPrice(string)`, which viem refuses to encode because they are indistinguishable on the wire.
+**Adding a chain:** add a `requireEnv("…_RPC_URL")` line at the top of `src/modules/rpc/index.ts`, a matching `.all("/{chain}", ...)` route, the var in `.env.example`, and a row in the routing test in `src/test/rpc.test.ts`.
 
 ## Rate limiting
 
-Both modules use [`elysia-rate-limit`](https://github.com/rayriffy/elysia-rate-limit) with identical configuration, tuned separately per endpoint at the top of each controller:
+The rpc module uses [`elysia-rate-limit`](https://github.com/rayriffy/elysia-rate-limit), with the budget set in `src/config/rpc.ts` (currently 200 requests per rolling 60s per client, shared across all chains).
 
-```ts
-// src/modules/rpc/index.ts
-const RATE_LIMIT_MAX = 20;
-const RATE_LIMIT_DURATION_MS = 60_000;
-
-// src/modules/prices/index.ts
-const RATE_LIMIT_MAX = 20;
-const RATE_LIMIT_DURATION_MS = 60_000;
-```
-
-- **Independent buckets** — a client gets 20 req/min on `/rpc/*` *and* 20 req/min on `/prices/*`. Exhausting one does not throttle the other.
 - **`countFailedRequest: true`** — 4xx/5xx responses still consume the budget, so an attacker cannot spam deliberately-erroring calls for free.
-- **`scoping: "scoped"`** — the limiter's hooks apply only to the module they live in; `/` is never throttled.
+- **`scoping: "scoped"`** — the limiter's hooks apply only to the rpc module; `/` is never throttled.
 - **Client key** — the custom generator (see `src/lib/client-id.ts`) returns `sha256(salt || ip)` as a hex string. The plugin's default LRU stores that digest, not the IP. Unidentifiable clients (no peer IP available) share one bucket under the empty-string key.
 
 ## Privacy posture
 
 The goal across the whole app is: **the upstream RPC provider cannot distinguish customers, and this server never stores customer information.** Concretely:
 
-- **No logging.** Neither module calls `console.log`, no access logs, no request/response bodies written anywhere. The only log is a single startup line in `src/index.ts`.
-- **No persistence of client data.** The only thing written to disk is the cached `/markets` snapshot (public market data fetched from CoinGecko on a cron, keyed by coin — never tied to a client). No request bodies, no cookies, no per-client rows.
+- **No logging.** No access logs, no request/response bodies written anywhere. The only log is a single startup line in `src/index.ts`.
+- **No persistence.** Nothing is written to disk — no request bodies, no cookies, no per-client rows.
 - **IPs are not stored in plaintext.** The rate-limit LRU stores salted hashes only; the salt is in-process memory and dies with the process.
 - **Customer headers are dropped, not passed through.** `RpcService.proxy` uses an allowlist (not a denylist), so new browser fingerprinting headers are blocked by default.
-- **User-Agent is overwritten.** Every outbound request carries `unitmetal-api/1.0` regardless of what the customer sent.
+- **User-Agent is overwritten.** Every outbound request carries `zxstim-rpc/1.0` regardless of what the customer sent.
 
 ## Deployment note — reverse proxies
 
 The rate-limit generator uses `server.requestIP(request)`, which returns the direct TCP peer. If you deploy behind a load balancer, CDN, or any reverse proxy, every customer will share the LB's IP and be bucketed together.
 
-When that happens, update the `generator` in both `src/modules/rpc/index.ts` and `src/modules/prices/index.ts` to read the real client IP from `x-forwarded-for` (and trust it only from the LB — not from arbitrary clients). Do it in the generator *before* `RpcService.proxy` strips that header for the outbound request.
+When that happens, update the `generator` in `src/modules/rpc/index.ts` to read the real client IP from `x-forwarded-for` (and trust it only from the LB — not from arbitrary clients). Do it in the generator *before* `RpcService.proxy` strips that header for the outbound request.
 
 ## Testing
 
@@ -194,10 +113,9 @@ bun run test
 ```
 
 - `src/test/root.test.ts` — smoke tests for the root route.
-- `src/test/rpc.test.ts` — replaces `globalThis.fetch` with a capturing mock and asserts that outbound requests have their identifying headers stripped, the fixed `User-Agent` set, the body forwarded byte-for-byte, and CORS headers on the response; also confirms `OPTIONS` preflights never reach the upstream.
-- `src/test/prices.test.ts` — hits the real upstream RPC (via the env-configured URL) and asserts the response is an array of `{ chainId, address, price }` entries, every entry has `chainId === 1`, ETH is present at the zero address with a non-null price (validates the WETH substitution), and CORS headers are present.
+- `src/test/rpc.test.ts` — replaces `globalThis.fetch` with a capturing mock and asserts that outbound requests have their identifying headers stripped, the fixed `User-Agent` set, the body forwarded byte-for-byte, and CORS headers on the response; also confirms `OPTIONS` preflights never reach the upstream, and that each `/rpc/{chain}` path reaches its own `*_RPC_URL` upstream.
 
-The prices test is effectively an integration test and depends on upstream liveness. Mocking viem at the wire level was considered and rejected as fragile (Multicall3 responses are ABI-encoded per-call).
+No test hits a real upstream, but the RPC module still requires all six `*_RPC_URL` env vars to be set to load. Any values work, but give them distinct values or the routing test can't catch a route pointing at the wrong chain.
 
 ---
 

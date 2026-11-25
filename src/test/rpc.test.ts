@@ -1,5 +1,7 @@
 /**
- * Tests for the /rpc/ethereum proxy endpoint.
+ * Tests for the /rpc/* proxy endpoints. Privacy/passthrough behaviour is
+ * exercised on /rpc/ethereum (every chain shares `RpcService.proxy`); the
+ * routing table is checked for every chain.
  *
  * These tests replace `globalThis.fetch` with a mock that captures the
  * outbound request. That lets us assert privacy behaviour (stripped
@@ -107,7 +109,7 @@ describe("POST /rpc/ethereum", () => {
     const fwd = new Headers(lastCall!.init!.headers as HeadersInit);
 
     // User-Agent is overridden to the fixed proxy value.
-    expect(fwd.get("user-agent")).toBe("unitmetal-api/1.0");
+    expect(fwd.get("user-agent")).toBe("zxstim-rpc/1.0");
 
     // All identifying headers are dropped.
     expect(fwd.get("accept-language")).toBeNull();
@@ -166,5 +168,45 @@ describe("POST /rpc/ethereum", () => {
     // CORS plugin responded — no upstream call was made.
     expect(lastCall).toBeNull();
     expect(res.headers.get("access-control-allow-origin")).toBeTruthy();
+  });
+});
+
+describe("chain routing", () => {
+  const originalFetch = globalThis.fetch;
+  let upstreamUrl: string | null;
+
+  beforeEach(() => {
+    upstreamUrl = null;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      upstreamUrl = typeof input === "string" ? input : input.toString();
+      return new Response(UPSTREAM_RESPONSE_BODY, { status: 200 });
+    }) as typeof globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  // Each path must reach the upstream from its own env var. Catches a
+  // copy-paste route pointing at the wrong chain (only detectable when the
+  // env values differ, which they do in any real config).
+  test.each([
+    ["/rpc/ethereum", "ETHEREUM_RPC_URL"],
+    ["/rpc/arbitrum", "ARBITRUM_RPC_URL"],
+    ["/rpc/base", "BASE_RPC_URL"],
+    ["/rpc/sepolia", "SEPOLIA_RPC_URL"],
+    ["/rpc/arbitrum-sepolia", "ARBITRUM_SEPOLIA_RPC_URL"],
+    ["/rpc/base-sepolia", "BASE_SEPOLIA_RPC_URL"],
+  ])("%s proxies to %s", async (path, envVar) => {
+    const res = await rpc.handle(
+      new Request(`http://localhost${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      })
+    );
+
+    expect(res.status).toBe(200);
+    expect(upstreamUrl).toBe(process.env[envVar]!);
   });
 });
