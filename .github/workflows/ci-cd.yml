@@ -1,7 +1,8 @@
 # CI/CD for zxstim-rpc
 #
 #   pull request → main/develop   test only
-#   push develop                  test → build image → deploy to "develop"    (stack zxstim-rpc-dev, 127.0.0.1:8002)
+#   push develop                  test → build image → deploy to "develop" (stack zxstim-rpc-dev, 127.0.0.1:8002)
+#                                 → smoke-test it on the server → tear it down (develop is throwaway)
 #   push main                     test → build image → deploy to "production" (stack zxstim-rpc,     127.0.0.1:8001)
 #
 # Both deploy to the same server (Tailscale machine zxstim-rpc). Secrets live
@@ -157,10 +158,11 @@ jobs:
             ConnectTimeout 20
           EOF
 
-      - name: Upload compose file and deploy script
+      - name: Upload compose file and scripts
         run: |
           ssh server "cat > /opt/$STACK/compose.yaml" < deploy/compose.yaml
           ssh server "cat > /opt/$STACK/deploy.sh && chmod 700 /opt/$STACK/deploy.sh" < deploy/deploy.sh
+          ssh server "cat > /opt/$STACK/smoke-test.sh && chmod 700 /opt/$STACK/smoke-test.sh" < deploy/smoke-test.sh
 
       - name: Write .env from environment secrets
         env:
@@ -185,3 +187,17 @@ jobs:
 
       - name: Verify from the server
         run: ssh server "curl -fsS http://127.0.0.1:$HOST_PORT/health && echo"
+
+      # develop is a throwaway test environment: test the live stack on the
+      # server, then remove it (containers, Redis, network, and the .env
+      # holding secrets). Production keeps running and is never smoke-tested
+      # (the smoke test deliberately stops Redis).
+      - name: Smoke test on the server (develop only)
+        if: github.ref_name == 'develop'
+        run: ssh server "/opt/$STACK/smoke-test.sh $STACK $HOST_PORT"
+
+      - name: Tear down the test stack (develop only, always)
+        if: always() && github.ref_name == 'develop'
+        run: |
+          [ -f ~/.ssh/config ] || { echo "never connected to the server; nothing to tear down"; exit 0; }
+          ssh server "cd /opt/$STACK && docker compose -p $STACK -f compose.yaml down -v --remove-orphans --timeout 10 2>&1 | tail -n 3; rm -f .env .env.next .env.prev .image; echo 'left in /opt/$STACK:' \$(ls)"

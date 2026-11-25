@@ -114,12 +114,13 @@ The app sits behind nginx (TLS) and Docker, so its TCP peer is never the real cl
 | Event | Jobs | Target |
 |---|---|---|
 | PR into `main` / `develop` | test | — |
-| push `develop` | test → build → deploy | GitHub env **develop** → stack `zxstim-rpc-dev` on `127.0.0.1:8002` (internal only) |
+| push `develop` | test → build → deploy → **smoke test on the server → tear down** | GitHub env **develop** → stack `zxstim-rpc-dev` on `127.0.0.1:8002`. Throwaway: tested in place of a laptop, then removed with its `.env` |
 | push `main` | test → build → deploy | GitHub env **production** → stack `zxstim-rpc` on `127.0.0.1:8001` (nginx: `rpc.zxstim.com`, `api.unitmetal.com`) |
 
 - **Image:** `ghcr.io/zxstimlabs/eth-rpc:<commit-sha>` (+ `:<branch>`), built from the `Dockerfile` `runtime` target. It contains no secrets.
 - **Secrets** (the six `*_RPC_URL`) live in the GitHub environment and only reach the server at deploy time, as `/opt/<stack>/.env` (mode 600).
 - **Access:** the runner joins Tailscale with a per-environment OIDC credential (no stored secret) as `tag:ci`, which the tailnet policy lets reach only `tag:server`'s SSH, as user `deploy`. The server has no public SSH.
+- **develop smoke test** (`deploy/smoke-test.sh`, refuses non-dev stacks): `/health`; every chain returns its correct chain id (catches wrong or swapped secrets); CORS preflight; per-client rate-limit counting in Redis (no raw IPs, 60s expiry, persistence off); a Redis outage → 503 + `Retry-After`, then recovery; the app logged only its startup line.
 - **On the server:** `deploy/deploy.sh` swaps in the new `.env`, pulls, restarts, checks `/health` for 30s, and **rolls back** to the previous image and `.env` if unhealthy.
 - **Rollback by hand:** re-run the workflow for an earlier commit (Actions → CI/CD → Run workflow on that branch), or on the server: `IMAGE=<old ref> HOST_PORT=<port> docker compose -p <stack> -f /opt/<stack>/compose.yaml up -d`.
 - Workflow logs are public (public repo): nothing in the pipeline prints secrets or container logs.

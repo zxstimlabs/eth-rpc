@@ -57,8 +57,9 @@ Copy `src/modules/rpc/index.ts` when adding a module:
 
 ## Deployment
 
-- `.github/workflows/ci-cd.yml`: push `develop` → GitHub env **develop** → stack `zxstim-rpc-dev` (127.0.0.1:8002); push `main` → env **production** → stack `zxstim-rpc` (127.0.0.1:8001, behind nginx). PRs run tests only. Actions are pinned by commit SHA; keep it that way when bumping.
+- `.github/workflows/ci-cd.yml`: push `develop` → GitHub env **develop** → stack `zxstim-rpc-dev` (127.0.0.1:8002) → `deploy/smoke-test.sh` on the server → **torn down** (containers, Redis, `.env`). develop is throwaway: the user tests there instead of on their laptop; push `main` → env **production** → stack `zxstim-rpc` (127.0.0.1:8001, behind nginx). PRs run tests only. Actions are pinned by commit SHA; keep it that way when bumping.
 - Server = Tailscale machine `zxstim-rpc` (Hetzner, Ubuntu 26.04). The runner joins as `tag:ci` via a per-environment Tailscale OIDC credential (GitHub vars `TS_CLIENT_ID`/`TS_AUDIENCE`) and SSHes as `deploy` (the only user tag:ci may use). `deploy/deploy.sh` runs there: swaps `.env.next` → `.env`, pulls, restarts, checks `/health`, rolls back on failure.
+- `deploy/smoke-test.sh` stops Redis on purpose and refuses any stack not ending in `-dev`. Never run it against production.
 - **Public repo ⇒ public workflow logs.** Never echo secrets, `.env` contents, or container logs in the workflow or `deploy.sh`. Secrets go over SSH stdin, never argv.
 - Adding an env var the app needs: add it to both GitHub environments, to the `.env` writer step in the workflow, to `.env.example`, and to the test env (`deploy/compose.test.yaml` and the workflow's test job).
 - `TRUST_PROXY=1` (set in `deploy/compose.yaml`) makes the rate limiter key on nginx's `X-Real-IP`. It's only safe because the app port is bound to 127.0.0.1. Never publish the app port publicly with it on.
