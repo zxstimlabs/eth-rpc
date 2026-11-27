@@ -6,7 +6,8 @@
 #   smoke-test.sh <stack> <host-port>
 #
 # For the throwaway "develop" stack only. It stops Redis on purpose (to
-# prove the service fails closed), so never point it at production.
+# prove the service fails closed) and writes a test account and payment
+# into Postgres, so never point it at production.
 #
 # Output goes to the public workflow log, so it prints only status codes,
 # chain ids and pass/fail lines — never URLs, headers with secrets, Redis
@@ -71,6 +72,60 @@ ttl_ok=1; for k in $(compose exec -T redis redis-cli --scan --pattern 'zxstim-rp
 check "$(compose exec -T redis redis-cli config get save | sed -n 2p)" "" "Redis RDB snapshots off (save)"
 check "$(compose exec -T redis redis-cli config get appendonly | sed -n 2p)" no "Redis AOF off (appendonly)"
 
+echo "== billing: register a key, claim a payment, spend credits"
+# Fixed test vectors (bash can't compute keccak); src/test/keccak-calls.test.ts
+# asserts the hashes, so they can't drift. Test values only, safe to print.
+S=0x$(printf '11%.0s' $(seq 32))   # account secret
+K=$(printf '22%.0s' $(seq 32))     # API key, as it appears in a URL
+C=0x$(printf '33%.0s' $(seq 32))   # payment secret
+KEY_HASH=0xc4bd59e1394781d1c7bf20a2c0b30c2acc9fbdd52dc5e0d76917de4034ebdf59
+MEMO=0x02cc96397d444c8ebdd3c75f2c53fc945bed8aab1e8da3f22ecca96cd45f8c57
+psql() { compose exec -T postgres psql -U zxstim -d zxstim_rpc -v ON_ERROR_STOP=1 -qtAc "$1"; }
+call='{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+batch="[$call,$call,$call]"
+# POST to /rpc/<chain>/<key>; prints "<http-code> <x-credits-remaining> <result>".
+billed() {
+  local hdrs body code left
+  hdrs=$(mktemp)
+  body=$(curl -s -m 20 -D "$hdrs" -H 'content-type: application/json' -H 'x-real-ip: 198.51.100.7' -d "$2" "$base/rpc/$1/$K")
+  code=$(tr -d '\r' < "$hdrs" | awk 'NR==1{print $2}')
+  left=$(tr -d '\r' < "$hdrs" | awk -F': ' 'tolower($1)=="x-credits-remaining"{print $2}')
+  rm -f "$hdrs"
+  echo "$code ${left:--} $(printf '%s' "$body" | sed -n 's/.*"result":"\(0x[0-9a-fA-F]*\)".*/\1/p' | head -1)"
+}
+v1() { # <method> <path> <auth> [json] → "<http-code> <body>"
+  local out
+  out=$(curl -s -m 10 -w '\n%{http_code}' -X "$1" -H "authorization: $3" -H 'content-type: application/json' -H 'x-real-ip: 198.51.100.7' ${4:+-d "$4"} "$base$2")
+  echo "${out##*$'\n'} ${out%$'\n'*}"
+}
+
+read -r code _ <<<"$(billed sepolia "$call")"
+check "$code" 401 "unregistered key → 401"
+read -r code _ <<<"$(v1 POST /v1/account/keys "Account $S" "{\"keyHash\":\"$KEY_HASH\"}")"
+check "$code" 201 "register the key with the account secret"
+read -r code _ <<<"$(billed sepolia "$call")"
+check "$code" 402 "registered key without credits → 402"
+
+# Stand-in for the payment indexer: record an on-chain payment worth 50 credits.
+psql "insert into payments (chain_id, tx_hash, log_index, memo, token, amount, credits) values (11155111, '0x$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')', 0, '$MEMO', '0x0000000000000000000000000000000000000000', '1000000000000000', 50)" >/dev/null
+read -r code body <<<"$(v1 POST /v1/claims "Bearer 0x$K" "{\"secret\":\"$C\"}")"
+check "$code $body" '200 {"status":"credited","credits":50}' "claim the payment by its secret"
+read -r code _ <<<"$(v1 POST /v1/claims "Bearer 0x$K" "{\"secret\":\"$C\"}")"
+check "$code" 409 "claiming it again → 409"
+
+check "$(billed sepolia "$call")" "200 49 0xaa36a7" "billed eth_chainId on sepolia (1 credit)"
+read -r code left _ <<<"$(billed base-sepolia "$batch")"
+check "$code $left" "200 46" "billed batch of 3 on base-sepolia (3 credits)"
+read -r code body <<<"$(v1 GET /v1/account "Bearer 0x$K")"
+check "$code $body" '200 {"credits":46}' "GET /v1/account balance"
+check "$(psql 'select count(*) from payments where claimed')" 1 "payment marked claimed"
+check "$(psql "select count(*) from information_schema.columns where table_name = 'payments' and column_name like '%account%'")" 0 "payments table has no account column"
+dump=$(compose exec -T postgres pg_dump -U zxstim -d zxstim_rpc --data-only 2>/dev/null)
+printf '%s' "$dump" | grep -qE '198\.51\.100|203\.0\.113' && fail "a client IP appears in Postgres" || pass "no client IPs in Postgres"
+printf '%s' "$dump" | grep -qiE "${S#0x}|$K|${C#0x}" && fail "a raw secret or key appears in Postgres" || pass "Postgres holds only hashes (no secrets, keys or payment secrets)"
+check "$(psql 'show log_min_error_statement')" panic "Postgres never logs query text (log_min_error_statement)"
+compose logs --no-color postgres 2>/dev/null | grep -qE '198\.51\.100|203\.0\.113|172\.[0-9]+\.[0-9]+\.[0-9]+' && fail "Postgres logged a client address" || pass "Postgres log has no client addresses"
+
 echo "== Redis outage → fails closed, then recovers"
 compose stop redis >/dev/null 2>&1
 check "$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$base/health")" 503 "GET /health with Redis down"
@@ -82,6 +137,10 @@ recovered=""; for i in $(seq 1 40); do [ "$(curl -s -m 2 -o /dev/null -w '%{http
 [ -n "$recovered" ] && pass "recovered after Redis restart (~$((recovered / 2))s)" || fail "did not recover within 20s of Redis restarting"
 read -r code got <<<"$(chain_id ethereum 198.51.100.2)"
 check "$code $got" "200 0x1" "/rpc/ethereum after recovery"
+# Redis lost the live lease (46 credits). The next refill refunds all of it,
+# so the customer is never short-changed (they got the 4 spent calls free).
+read -r code left _ <<<"$(billed sepolia "$call")"
+if [ "$code" = 200 ] && [ "${left:-0}" -ge 45 ]; then pass "billed route after Redis restart: lease refunded ($left left)"; else fail "billed route after Redis restart (HTTP $code, ${left:-none} left; want 200, ≥45)"; fi
 
 echo "== privacy: the app logged nothing but its startup line"
 lines=$(compose logs --no-color --no-log-prefix app 2>/dev/null | grep -c .)

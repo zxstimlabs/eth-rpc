@@ -11,27 +11,28 @@ An [Elysia](https://elysiajs.com) / [Bun](https://bun.sh) backend that exposes p
 | Arbitrum Sepolia | `/rpc/arbitrum-sepolia` | `ARBITRUM_SEPOLIA_RPC_URL` |
 | Base Sepolia     | `/rpc/base-sepolia`     | `BASE_SEPOLIA_RPC_URL`     |
 
-Every endpoint is designed to be called directly from a browser: open CORS, per-client rate limiting, zero request logging, and no persistence of client data. The server writes nothing to disk.
+Every endpoint is designed to be called directly from a browser: open CORS, per-client rate limiting, zero request logging, and no client data at rest. Each path also has a **billed** form, `/rpc/{chain}/{api-key}`, that spends prepaid credits (see [Billing](#billing-prepaid-credits)).
 
 ## Getting Started
 
 ```bash
 bun install
-cp .env.example .env.local   # then fill in all six *_RPC_URL values (and REDIS_URL)
+cp .env.example .env.local   # then fill in REDIS_URL, DATABASE_URL and all six *_RPC_URL values
 bun run dev
 ```
 
 Open http://localhost:8000/ with your browser to see the result.
 
-All six RPC URLs (mainnet and testnet) are required — the RPC module reads them once at load and the server refuses to start if any is missing.
+Every variable in `.env.example` is required — the server reads them once at load and refuses to start if any is missing, if Redis or Postgres is unreachable, or if its migrations fail.
 
 ## Scripts
 
-| Command          | What it does                                                  |
-| ---------------- | ------------------------------------------------------------- |
-| `bun run dev`    | Start the dev server on `:8000` with file-watch reload.       |
-| `bun run test`   | Run the Bun test suite (`src/test/**/*.test.ts`).             |
-| `bun run build`  | Compile a standalone binary to `./build/zxstim-rpc`.       |
+| Command               | What it does                                                        |
+| --------------------- | ------------------------------------------------------------------- |
+| `bun run dev`         | Start the dev server on `:8000` with file-watch reload.             |
+| `bun run test`        | Run the Bun test suite (`src/test/**/*.test.ts`).                   |
+| `bun run build`       | Compile a standalone binary to `./build/zxstim-rpc`.                |
+| `bun run db:generate` | Generate a SQL migration in `./drizzle` from `src/db/schema.ts`.    |
 
 `bun run test` loads `.env.local` explicitly via `--env-file`, because `bun test` deliberately ignores `.env.local` by default.
 
@@ -39,14 +40,24 @@ All six RPC URLs (mainnet and testnet) are required — the RPC module reads the
 
 ```
 src/
-├── index.ts              # Root Elysia app — connects Redis, mounts the rpc module, /health, listens on :8000
+├── index.ts              # Root app — connects Redis, migrates Postgres, mounts modules, /health, :8000
 ├── config/
-│   └── rpc.ts            # Server-side rate-limit budget. Never client-supplied.
+│   ├── rpc.ts            # Rate-limit budgets (keyless and billed). Never client-supplied.
+│   └── billing.ts        # Lease sizes, key limits, batch cap, blocked methods
+├── db/
+│   ├── schema.ts         # Drizzle schema: accounts, api_keys, payments, indexer_state
+│   └── index.ts          # Bun SQL client + Drizzle, migrateDb(), dbHealthy()
 ├── lib/
-│   └── client-id.ts      # Salted SHA-256 hash of client IP (rate-limit key)
+│   ├── client-id.ts      # Salted SHA-256 hash of client IP (rate-limit key)
+│   ├── keccak.ts         # Ethereum keccak256: account ids, key hashes, payment memos
+│   ├── redis.ts          # Shared Redis client
+│   ├── redis-rate-limit.ts
+│   └── billing/          # Leases (hot path), accounts/keys, claims, call counting
 ├── modules/
-│   └── rpc/              # Header-sanitizing JSON-RPC proxy (controller + service)
-└── test/                 # Bun tests (root, rpc)
+│   ├── rpc/              # JSON-RPC proxy: keyless and billed routes (controller + service)
+│   └── account/          # /v1 key registration, balance, claims (controller + service)
+└── test/
+drizzle/                  # Generated SQL migrations (committed), applied at startup
 ```
 
 ### Architecture
@@ -58,7 +69,7 @@ The app follows Elysia's recommended **feature-based module** pattern ([MVC guid
 - **Root app (`src/index.ts`)** — imports each module and mounts it via `.use(module)`. Adding a new feature = add a new folder under `modules/` and one `.use()` call.
 - **Per-feature config (`src/config/`)** — server-side defaults (rate-limit budgets, timeouts) kept out of the controllers. These are applied server-side and never accepted from the client.
 
-**Privacy primitives live in `src/lib/`.** `client-id.ts` exports `hashClientIp(ip)`: a SHA-256 over a process-lifetime random salt plus the IP. The rate limiter calls it, so the in-memory LRU stores only opaque hex digests. The salt never leaves the process, so a memory dump of the rate-limit cache cannot be reversed back to IPs without also capturing the salt at the same moment.
+**Privacy primitives live in `src/lib/`.** `client-id.ts` exports `hashClientIp(ip)`: a SHA-256 over a process-lifetime random salt plus the IP. The rate limiter calls it, so Redis stores only opaque hex digests. The salt never leaves the process. `keccak.ts` derives the only identifiers billing stores (see below).
 
 ## Endpoints
 
@@ -80,26 +91,75 @@ Point viem / ethers / web3.js at that URL instead of your Alchemy/Infura/etc. UR
 
 **CORS:** `Access-Control-Allow-Origin: *`, credentials off. `OPTIONS` preflights are short-circuited by `@elysiajs/cors` and never proxied upstream.
 
-**Adding a chain:** add a `requireEnv("…_RPC_URL")` line at the top of `src/modules/rpc/index.ts`, a matching `.all("/{chain}", ...)` route, the var in `.env.example`, and a row in the routing test in `src/test/rpc.test.ts`.
+**Adding a chain:** add a `[path, requireEnv("…_RPC_URL")]` entry to `UPSTREAMS` in `src/modules/rpc/index.ts` (both the keyless and billed routes use it), the var in `.env.example`, and a row in the routing test in `src/test/rpc.test.ts`.
+
+### `POST /rpc/{chain}/{api-key}` — billed JSON-RPC proxy
+
+Same proxy, same privacy, but each JSON-RPC call costs 1 credit (a batch of N costs N). The key is in the path because a wallet's "custom RPC" setting only takes a URL; nginx keeps no access log, so it isn't written anywhere.
+
+| Response | When |
+|---|---|
+| upstream's response + `X-Credits-Remaining` | charged; JSON-RPC errors such as `execution reverted` count (the upstream did the work) |
+| upstream 5xx / 429, or 502 | upstream failed → **refunded** |
+| `400` | not JSON-RPC, a batch over 100 calls, or a blocked method (`debug_*`, `trace_*`) — not charged |
+| `401` / `402` | unknown or revoked key / out of credits (JSON-RPC error body) |
+| `503` + `Retry-After` | Redis or Postgres unavailable — fails closed, nothing proxied |
+
+Rate limit: 1,200 requests/min per client IP (`rpcConfig.keyedRateLimit`), per IP rather than per key so minting random keys can't buy fresh buckets.
+
+### `/v1` — accounts, keys, claims
+
+| Endpoint | Auth | |
+|---|---|---|
+| `POST /v1/account/keys` `{keyHash}` | `Authorization: Account <account-secret>` | register an API key (by its hash); creates the account on first use |
+| `DELETE /v1/account/keys/{keyHash}` | `Account …` | revoke a key (revoked keys stay revoked) |
+| `GET /v1/account` | `Authorization: Bearer <api-key>` | `{credits}` |
+| `POST /v1/claims` `{secret}` | `Bearer …` | claim a payment: `200` credited, `202` not seen on-chain yet (retry), `409` already claimed |
+
+60 requests/min per client IP. All values are 32 bytes of hex (`0x` optional).
+
+## Billing (prepaid credits)
+
+Mullvad-style: no email, no username, no wallet address. **An account is a 32-byte secret** that the wallet derives from its seed (BIP-85), so the seed phrase is the backup. The server only ever stores keccak256 digests:
+
+```
+account id = keccak256("zxstim-rpc/account/v1" ‖ account_secret)
+key hash   = keccak256(api_key)                      (API keys are derived by the wallet too)
+secret_n   = keccak256(account_secret ‖ "zxstim-rpc/pay/v1" ‖ uint256(n))   (wallet only)
+memo_n     = keccak256(secret_n)                     (goes on-chain)
+```
+
+**Paying.** The wallet calls the ownerless payment contract ([zxstimlabs/rpc-pay-contracts](https://github.com/zxstimlabs/rpc-pay-contracts)) with a fresh `memo_n`: ETH (0.001 / 0.002 / 0.005 / 0.01 / 0.02 / 0.05) or USDC/USDT ($2 / $5 / $10 / $50 / $100) on Ethereum, Base or Arbitrum (testnets for develop). Fixed amounts make payments hard to tell apart; one-time memos make them unlinkable. Funds go straight to the treasury (a Safe); the contract holds nothing and has no owner.
+
+**Claiming.** A payment indexer records each `Paid(memo, token, amount)` event in `payments` with its credits ($1 = 10,000 credits; ETH valued at the Chainlink ETH/USD price at the payment's block). The wallet then posts `secret_n` to `/v1/claims` with its API key: the server checks `keccak256(secret_n)`, marks the payment claimed and adds the credits. Anyone can read a memo on-chain, but only the wallet knows the secret. The payment ↔ account link exists only during that request; **`payments` has no account column.** After a lost phone, the wallet re-derives its memos from the seed, finds them on-chain and claims anything unclaimed.
+
+**Spending — leases.** Every credit is in exactly one place: Postgres `accounts.balance`, or a Redis *lease* (`src/lib/billing/leases.ts`):
+
+- A billed request is one atomic Redis script: lease ≥ n → subtract; otherwise refill.
+- A refill moves up to 1,000 credits from Postgres into the lease (`balance -= take`, `leased += take`) under a per-account lock, in the background once a lease falls below 200. One Postgres write per ~1,000 calls instead of one per call, no hot-row contention, and requests keep flowing through a brief Postgres outage.
+- Leases idle for 5 minutes go back to Postgres. Claims only touch Postgres; the next refill picks them up — there's no cache to invalidate.
+- **Redis keeps nothing on disk.** If it restarts, the leases are gone; a random `epoch` key changes, and each account's next refill sees its `leased` belongs to a dead epoch and **refunds all of it**. The customer loses nothing; we give away at most one lease ($0.10) per active account.
+
+**Not built yet:** the payment indexer (needs the deployed contract addresses), contract deployment, and the wallet side. Open: Postgres backups (encrypted, off the box), the free allowance for keyless users of our own apps, an `eth_getLogs` block-range cap.
 
 ## Rate limiting
 
-The rpc module uses [`elysia-rate-limit`](https://github.com/rayriffy/elysia-rate-limit), with the budget set in `src/config/rpc.ts` (currently 200 requests per fixed 60s window per client, shared across all chains). **Counts live in Redis** (`src/lib/redis-rate-limit.ts`, Bun's built-in client), not in process memory.
+The rpc and account modules use [`elysia-rate-limit`](https://github.com/rayriffy/elysia-rate-limit), with budgets in `src/config/` (keyless: 200 requests per fixed 60s window per client, shared across all chains). **Counts live in Redis** (`src/lib/redis-rate-limit.ts`, Bun's built-in client), not in process memory.
 
 - **`countFailedRequest: true`** — 4xx/5xx responses still consume the budget, so an attacker cannot spam deliberately-erroring calls for free.
-- **`scoping: "scoped"`** — the limiter's hooks apply only to the rpc module; `/` and `/health` are never throttled.
-- **Client key** — the custom generator (see `src/lib/client-id.ts`) returns `sha256(salt || ip)` as a hex string; Redis stores that digest (under `zxstim-rpc:rl:rpc:`), never the IP. Each key expires with its window. Unidentifiable clients share one bucket under the empty-string key.
-- **Fails closed** — if Redis is down, stalled (> 500 ms) or erroring, `/rpc/*` answers **503** with `Retry-After: 5` (CORS headers intact) instead of serving uncounted traffic. The server also refuses to start without Redis. `GET /health` returns 200 only while Redis answers.
-- **Redis config** (`deploy/compose.yaml`) — persistence off (`--save ""`, no AOF), 64 MB cap, no published port: counters exist only in memory, only for their window.
-- The salt is still per-process, so counts reset when the app restarts (as before).
+- **`scoping: "scoped"`** — each limiter's hooks apply only to its module; `/` and `/health` are never throttled.
+- **Client key** — the custom generator (see `src/lib/client-id.ts`) returns `sha256(salt || ip)` as a hex string; Redis stores that digest (under `zxstim-rpc:rl:*`), never the IP. Each key expires with its window. Unidentifiable clients share one bucket under the empty-string key.
+- **Fails closed** — if Redis is down, stalled (> 500 ms) or erroring, requests get **503** with `Retry-After: 5` (CORS headers intact) instead of being served uncounted. `GET /health` returns 200 only while Redis and Postgres both answer.
+- **Redis config** (`deploy/compose.yaml`) — persistence off (`--save ""`, no AOF), 64 MB cap, no published port. Counters and the key cache expire; credit leases don't, so they're never evicted.
+- The salt is per-process, so counts reset when the app restarts.
 
 ## Privacy posture
 
-The goal across the whole app is: **the upstream RPC provider cannot distinguish customers, and this server never stores customer information.** Concretely:
+The goal across the whole app is: **the upstream RPC provider cannot distinguish customers, and this server never stores who its customers are.** Concretely:
 
-- **No logging.** No access logs, no request/response bodies written anywhere. The only log is a single startup line in `src/index.ts`.
-- **No persistence.** Nothing is written to disk — no request bodies, no cookies, no per-client rows. Redis holds only salted-hash rate-limit counters, in memory, each expiring with its 60s window.
-- **IPs are not stored in plaintext.** The rate-limit LRU stores salted hashes only; the salt is in-process memory and dies with the process.
+- **No logging.** No access logs, no request/response bodies written anywhere. The only log is a single startup line in `src/index.ts`. Postgres runs with `log_min_error_statement=panic` (never logs query text) and no connection logging.
+- **Billing state only, no client data, at rest.** Postgres holds account ids, API key hashes, balances and on-chain payments — digests and numbers. No IPs, no timestamps, no request records, no wallet addresses, and nothing links a payment to an account. Redis holds salted-hash rate-limit counters (each expiring with its window), credit leases, and a key-hash cache, in memory only.
+- **IPs are not stored in plaintext.** The rate limiter stores salted hashes only; the salt is in-process memory and dies with the process.
 - **Customer headers are dropped, not passed through.** `RpcService.proxy` uses an allowlist (not a denylist), so new browser fingerprinting headers are blocked by default.
 - **User-Agent is overwritten.** Every outbound request carries `zxstim-rpc/1.0` regardless of what the customer sent.
 
@@ -114,175 +174,29 @@ The app sits behind nginx (TLS) and Docker, so its TCP peer is never the real cl
 | Event | Jobs | Target |
 |---|---|---|
 | PR into `main` / `develop` | test | — |
-| push `develop` | test → build → deploy → **smoke test on the server → tear down** | GitHub env **develop** → stack `zxstim-rpc-dev` on `127.0.0.1:8002`. Throwaway: tested in place of a laptop, then removed with its `.env` |
+| push `develop` | test → build → deploy → **smoke test on the server → tear down** | GitHub env **develop** → stack `zxstim-rpc-dev` on `127.0.0.1:8002`. Throwaway: tested in place of a laptop, then removed with its `.env`, `db.env` and database |
 | push `main` | test → build → deploy | GitHub env **production** → stack `zxstim-rpc` on `127.0.0.1:8001` (nginx: `rpc.zxstim.com`, `api.unitmetal.com`) |
 
-- **Image:** `ghcr.io/zxstimlabs/eth-rpc:<commit-sha>` (+ `:<branch>`), built from the `Dockerfile` `runtime` target. It contains no secrets.
-- **Secrets** (the six `*_RPC_URL`) live in the GitHub environment and only reach the server at deploy time, as `/opt/<stack>/.env` (mode 600).
+- **Image:** `ghcr.io/zxstimlabs/eth-rpc:<commit-sha>` (+ `:<branch>`), built from the `Dockerfile` `runtime` target (binary + SQL migrations). It contains no secrets.
+- **Stack:** app + Redis 8.12 + Postgres 19 (`deploy/compose.yaml`), on a private network; only the app's port is published, on `127.0.0.1`.
+- **Secrets** (the six `*_RPC_URL`) live in the GitHub environment and only reach the server at deploy time, as `/opt/<stack>/.env` (mode 600). The **Postgres password** is generated on the server by `deploy.sh` into `/opt/<stack>/db.env` (mode 600) once per stack and never leaves it. Don't delete production's `db.env`: the data volume was initialised with it.
 - **Access:** the runner joins Tailscale with a per-environment OIDC credential (no stored secret) as `tag:ci`, which the tailnet policy lets reach only `tag:server`'s SSH, as user `deploy`. The server has no public SSH.
-- **develop smoke test** (`deploy/smoke-test.sh`, refuses non-dev stacks): `/health`; every chain returns its correct chain id (catches wrong or swapped secrets); CORS preflight; per-client rate-limit counting in Redis (no raw IPs, 60s expiry, persistence off); a Redis outage → 503 + `Retry-After`, then recovery; the app logged only its startup line.
+- **develop smoke test** (`deploy/smoke-test.sh`, refuses non-dev stacks): `/health`; every chain returns its correct chain id (catches wrong or swapped secrets); CORS preflight; per-client rate-limit counting in Redis (no raw IPs, 60s expiry, persistence off); billing end to end (register a key, claim a payment, spend credits, balance; no IPs or raw secrets in Postgres; Postgres logging off); a Redis outage → 503 + `Retry-After`, then recovery with the lost lease refunded; the app logged only its startup line.
 - **On the server:** `deploy/deploy.sh` swaps in the new `.env`, pulls, restarts, checks `/health` for 30s, and **rolls back** to the previous image and `.env` if unhealthy.
-- **Rollback by hand:** re-run the workflow for an earlier commit (Actions → CI/CD → Run workflow on that branch), or on the server: `IMAGE=<old ref> HOST_PORT=<port> docker compose -p <stack> -f /opt/<stack>/compose.yaml up -d`.
+- **Rollback by hand:** re-run the workflow for an earlier commit (Actions → CI/CD → Run workflow on that branch), or on the server: `IMAGE=<old ref> HOST_PORT=<port> docker compose -p <stack> -f /opt/<stack>/compose.yaml up -d`. Migrations only move forward, so keep schema changes backward-compatible with the previous image.
 - Workflow logs are public (public repo): nothing in the pipeline prints secrets or container logs.
 
 ## Testing
 
 ```bash
-bun run test
+docker compose -f deploy/compose.test.yaml run --rm --build test   # its own Redis + Postgres
+docker compose -f deploy/compose.test.yaml down
 ```
 
-- `src/test/root.test.ts` — smoke tests for the root route.
-- `src/test/rpc.test.ts` — replaces `globalThis.fetch` with a capturing mock and asserts that outbound requests have their identifying headers stripped, the fixed `User-Agent` set, the body forwarded byte-for-byte, and CORS headers on the response; also confirms `OPTIONS` preflights never reach the upstream, and that each `/rpc/{chain}` path reaches its own `*_RPC_URL` upstream.
+- `rpc.test.ts` — keyless proxy: headers stripped, fixed `User-Agent`, byte-for-byte body, CORS, preflights never proxied, per-chain routing, rate limiting and fail-closed 503.
+- `rpc-keyed.test.ts` — billed route: per-call charging, batches, refunds on upstream failure, 400/401/402/404/405/503, CORS-exposed balance header.
+- `billing-leases.test.ts` — the lease engine against real Redis + Postgres: refills, drains, concurrency (never overspends), refunds, idle returns, Redis-restart refund.
+- `billing-accounts.test.ts`, `account-api.test.ts` — keys (register, conflict, revoke, cap, cache), claims (once only, races, no account link stored), the /v1 API.
+- `keccak-calls.test.ts` — Ethereum keccak vectors (shared with the smoke test and the contract repo) and call counting.
 
-No test hits a real upstream, but the RPC module still requires all six `*_RPC_URL` env vars to be set to load. Any values work, but give them distinct values or the routing test can't catch a route pointing at the wrong chain.
-
----
-
-## TODO — Billing endpoint
-
-Not yet implemented. This section captures the design decisions reached so far so we can pick up where we left off. Code has **not** been written.
-
-### Model
-
-**Credits are the universal currency.** Every paid endpoint consumes N credits per call, where N is defined in a per-endpoint config file. Two funding sources feed the same credit ledger:
-
-```
-Stripe subscription  ──┐
-                       ├──► credit ledger  ◄── request pipeline (deducts per call)
-Crypto top-up        ──┘
-```
-
-- **Crypto (primary, privacy-preserving)**: pay-as-you-go top-ups. Customer sends USDC via a payment smart contract and gets credits added to their balance. This is the default path, aligned with the rest of the app's no-logging / no-PII posture.
-- **Stripe (secondary, for premium features)**: recurring subscription. On each successful renewal, a fixed monthly credit allowance is granted. Explicitly non-private — a customer choosing this path has already accepted being identified (Stripe holds their name, email, card). Used for premium features that crypto users may not need.
-
-One customer maps to one funding source. A Stripe customer and a crypto customer are separate account rows, never merged.
-
-### Privacy stance
-
-Goal: the server cannot link a customer's wallet address to their IP, and does not hold identifying information for crypto customers.
-
-- **IP ↔ API key link is transient.** On every request the server sees both the peer IP and the `Authorization: Bearer` key. This correlation exists in memory only for the duration of request handling; it is never logged or persisted. Rate-limit store (hashed IP) and credit store (hashed API key) are strictly separate tables with no joining column. A full DB dump gives an attacker no linkage.
-- **Wallet ↔ API key link is broken at topup.** At the moment of funding the server verifies the on-chain deposit event and credits the key's balance. The wallet address is **never** written to the database. See "Crypto payment architecture" below.
-- **Stripe path is a different trust zone.** Customers using Stripe are explicitly identified. This is surfaced in the product copy, not hidden.
-- **No access logs, no APM tracing with request attributes.** Same posture as the rest of the app.
-
-Accepted residual risk: a compromised server can correlate IP-to-key in real time by watching live traffic. Defending against this requires Tor hidden service / mixnet-level infra and is out of scope.
-
-### Identity & auth flow
-
-- **API keys**: random bytes, stored as `sha256(key)` in the DB. The key itself is given to the customer once at issuance and cannot be recovered.
-- **Request authentication**: `Authorization: Bearer <key>` header on every billable request.
-- **Key issuance**:
-  - Crypto path: wallet connect + SIWE-style signature proves ownership of the wallet, server mints an API key and binds the first deposit. No email, no account recovery — lose the key, lose access.
-  - Stripe path: Stripe Checkout flow establishes an email; server mints an API key bound to the `stripe_customer_id`. Key recovery possible via email.
-
-### Crypto payment architecture
-
-**Payment contract with commitment pattern.** Customer calls `deposit(bytes32 keyCommitment)` on a small custom contract, transferring USDC. The contract emits `Deposited(keyCommitment, amount)`. The `keyCommitment` is `sha256(api_key)` so the event does not reveal the key itself.
-
-Why this shape:
-- The event is keyed by commitment, not by wallet. Anyone watching the contract sees `(commitment, amount)` pairs, not `(wallet, commitment)`.
-- The server only reads event logs (never `eth_getTransactionReceipt`), so the wallet address (`receipt.from`) never enters the server process. A DB dump contains no wallet addresses.
-- The transaction sender is still public on-chain — we are not hiding the wallet from observers, only from our own server state.
-
-### Detection — deposit poller
-
-**Chain poller, not client-submitted tx hashes.** The frontend may POST the tx hash for snappier UX, but the server's source of truth is the poller; the POST is just a nudge.
-
-Decisions:
-
-| Choice                  | Value                                            | Rationale                                                                 |
-| ----------------------- | ------------------------------------------------ | ------------------------------------------------------------------------- |
-| Scheduler               | `@elysiajs/cron` plugin                          | Lifecycle-integrated with Elysia; named jobs; room to add more tasks.     |
-| Interval                | 30 seconds (`Patterns.EVERY_30_SECONDS`)         | Trivial RPC cost; user-perceived latency ~30–60s worst case.              |
-| Confirmation depth      | 12 blocks (~2.4 min post-Merge mainnet)          | Acceptable residual reorg risk for small-amount USDC top-ups.             |
-| Range query             | `eth_getLogs` over `[lastProcessed+1, head-12]`  | One RPC call per tick, covers all new blocks at once.                     |
-| Backfill chunk size     | ~5,000 blocks                                    | Below most providers' `eth_getLogs` range caps (Alchemy: 10k).            |
-| Overlap prevention      | `running` flag inside `run()` callback           | Croner (underlying lib) does not protect against overlapping runs.        |
-| Error handling          | Swallow, don't advance pointer, retry next tick  | Self-heals transient failures; no identifying log output.                 |
-| Startup seed            | `last_processed_block = contract_deploy_block`   | Avoid scanning Ethereum history from genesis on first run.                |
-
-Shutdown is handled by the plugin automatically when the Elysia app stops.
-
-### Storage — SQLite via `bun:sqlite`
-
-Zero-ops, single file, sufficient throughput for v1. Swap to Postgres later if multi-instance scaling is needed.
-
-Tables (rough sketch):
-
-- `customers(id, stripe_customer_id NULL, created_at)` — one row per account; either `stripe_customer_id` is set (Stripe path) or it isn't (crypto path). No wallet address stored.
-- `api_keys(key_hash PRIMARY KEY, customer_id, created_at, revoked_at NULL)` — SHA-256 of the key; one customer may hold multiple keys.
-- `credit_balances(customer_id PRIMARY KEY, balance)` — atomic decrement via `UPDATE ... SET balance = balance - ? WHERE customer_id = ? AND balance >= ?` and checking `changes()`.
-- `processed_deposits(tx_hash PRIMARY KEY, commitment, amount, block_number, processed_at)` — `UNIQUE(tx_hash)` is the idempotency guard; re-seeing the same event is a no-op.
-- `indexer_state(key PRIMARY KEY, value)` — single row for `last_processed_block`. Updated in the same transaction that credits balances, so a crash mid-batch leaves the pointer unmoved.
-- `stripe_events(event_id PRIMARY KEY, processed_at)` — webhook idempotency.
-
-### Enforcement middleware
-
-A new middleware sits on billable routes:
-
-1. Read `Authorization: Bearer <key>` from the request.
-2. `sha256(key)` → look up `api_keys` row → resolve `customer_id`.
-3. Read per-endpoint cost from the config file.
-4. Atomic decrement on `credit_balances`; if zero rows affected, return `402 Payment Required`.
-5. Run the handler.
-6. (TBD) Refund the credit if the handler failed due to an upstream / server-side issue.
-
-Middleware order: rate limit first (cheap, in-memory LRU) → credit check (DB hit) → handler.
-
-### Subscription (Stripe) flow
-
-- Customer creates subscription via Stripe Checkout (hosted page). Server stores only `stripe_customer_id`.
-- `invoice.paid` webhook → look up customer → grant the tier's monthly credit allowance to `credit_balances`.
-- Signature verification on every webhook; `stripe_events.event_id` dedupes replays.
-- Subscription lapse (`customer.subscription.deleted`): customer's monthly grants stop; any unconsumed credits remain spendable until gone (or until the rollover policy says otherwise — see open questions).
-
-### Module structure (planned)
-
-```
-src/
-├── modules/
-│   ├── deposits/
-│   │   ├── index.ts          # @elysiajs/cron registration + HTTP endpoints
-│   │   ├── service.ts        # DepositsService: eth_getLogs, parse, credit
-│   │   └── poller.ts         # Tick function with overlap guard
-│   └── billing/
-│       ├── index.ts          # Stripe webhook endpoint, signature verification
-│       └── service.ts        # BillingService: subscription state, credit grants
-├── lib/
-│   ├── db.ts                 # bun:sqlite handle + schema init
-│   ├── credits.ts            # Atomic decrement / refund / grant helpers
-│   └── auth.ts               # API key hashing + lookup
-└── config/
-    └── pricing.ts            # Per-endpoint credit cost map
-```
-
-Endpoints tentatively:
-
-- `POST /deposits/notify` — client nudges the server with a tx hash (optional; poller is source of truth).
-- `GET /deposits/:tx_hash/status` — polled by the frontend to flip the UI from "pending" to "credited".
-- `POST /billing/stripe/webhook` — Stripe webhook sink.
-- Future: account management endpoints (key rotation, balance query, etc.).
-
-### Open questions (still to decide)
-
-- **Rollover policy for subscription credits.** Expire monthly (simple, customer-hostile), roll over uncapped (customer-friendly, builds financial liability), or roll over capped (typical). Affects the schema — may need a separate `subscription_credits` column with an expiration timestamp.
-- **Single vs split bucket.** When a Stripe subscriber also tops up with crypto, are those one balance or two? Leaning split (spend subscription credits first; they may expire; top-up credits never do), but open to debate.
-- **Refund semantics on request failure.** Upstream times out → refund? Upstream returns a valid JSON-RPC error response → charge (server did the work)? Customer sent malformed input → charge? Tentative rule: "refund only when the server itself failed, not when the upstream returned an answer we proxied."
-- **Credit pricing.** How much is 1 credit in USDC? Flat rate, bulk discount, tier-based?
-- **Subscription tier structure.** One tier or several? Maps to Stripe Prices.
-- **Frontend auth specifics.** SIWE message format, session token lifetime, key storage (localStorage vs HTTP-only cookie set after SIWE).
-- **Reverse-proxy IP handling.** Existing rate-limit deployment note applies here too: if we ever sit behind an LB/CDN, the generator must read `x-forwarded-for` before stripping it.
-- **Observability.** Aggregate metrics (total calls per endpoint, deposits/day, revenue) are fine. Per-customer metrics require an authenticated account view; none are written to third-party APM tools.
-
-### What's locked in
-
-- Model: credits as universal currency; Stripe = monthly grant, crypto = top-up.
-- Two separate account types, never merged.
-- Payment contract with commitment pattern; wallet address never persisted server-side.
-- Poller: `@elysiajs/cron`, 30s interval, 12 block depth, `eth_getLogs` per tick, overlap guard flag.
-- Poller reads event logs only, never transaction receipts.
-- Storage: SQLite via `bun:sqlite`; in-process poller for v1.
-- Atomic decrement with row-affected check for credit deduction.
-- API keys stored as SHA-256 hashes; `Authorization: Bearer` header.
-- Idempotency: `UNIQUE(tx_hash)` for deposits, Stripe event IDs for webhooks.
+Tests need a disposable Redis (`REDIS_URL`) and Postgres (`DATABASE_URL`): they reset counters, pause Redis writes and write accounts. No test hits a real upstream, but all six `*_RPC_URL` must be set; give them distinct values or the routing test can't catch a route pointing at the wrong chain.

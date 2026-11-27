@@ -40,7 +40,12 @@ export abstract class RpcService {
    * The function does not inspect or mutate the body — it streams bytes
    * through in both directions. No logging occurs at any step.
    */
-  static async proxy(request: Request, upstream: string): Promise<Response> {
+  static async proxy(
+    request: Request,
+    upstream: string,
+    /** The already-read body (billed routes read it to count calls). */
+    body?: ArrayBuffer
+  ): Promise<Response> {
     // Build the outbound header set from scratch. Anything not in
     // FORWARD_HEADERS (user-agent, accept-language, sec-ch-ua-*,
     // sec-fetch-*, referer, origin, cookie, x-forwarded-*, etc.) is
@@ -71,7 +76,7 @@ export abstract class RpcService {
       // `arrayBuffer()` buffers the full body in memory. This is fine for
       // JSON-RPC payloads (kilobytes at most). The buffer is held only for
       // the duration of the outbound fetch, then garbage-collected.
-      init.body = await request.arrayBuffer();
+      init.body = body ?? (await request.arrayBuffer());
     }
 
     const response = await fetch(upstream, init);

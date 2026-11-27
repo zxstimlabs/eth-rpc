@@ -41,15 +41,28 @@ jobs:
     timeout-minutes: 10
     services:
       redis:
-        image: redis:8-alpine
+        image: redis:8.12-alpine
         ports: ["6379:6379"]
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 2s
           --health-timeout 2s
           --health-retries 15
+      postgres:
+        image: postgres:19-alpine
+        ports: ["5432:5432"]
+        env:
+          POSTGRES_USER: zxstim
+          POSTGRES_PASSWORD: test # throwaway CI database
+          POSTGRES_DB: zxstim_rpc
+        options: >-
+          --health-cmd "pg_isready -U zxstim -d zxstim_rpc"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
     env:
       REDIS_URL: redis://localhost:6379
+      DATABASE_URL: postgres://zxstim:test@localhost:5432/zxstim_rpc
       TRUST_PROXY: "1"
       # Fake upstreams: tests mock fetch. Distinct so routing tests can tell chains apart.
       ETHEREUM_RPC_URL: http://upstream.invalid/eth
@@ -189,9 +202,10 @@ jobs:
         run: ssh server "curl -fsS http://127.0.0.1:$HOST_PORT/health && echo"
 
       # develop is a throwaway test environment: test the live stack on the
-      # server, then remove it (containers, Redis, network, and the .env
-      # holding secrets). Production keeps running and is never smoke-tested
-      # (the smoke test deliberately stops Redis).
+      # server, then remove it (containers, Redis, Postgres and its volume,
+      # network, the .env holding secrets, and db.env). Production keeps
+      # running and is never smoke-tested (the smoke test deliberately stops
+      # Redis and writes test accounts).
       - name: Smoke test on the server (develop only)
         if: github.ref_name == 'develop'
         run: ssh server "/opt/$STACK/smoke-test.sh $STACK $HOST_PORT"
@@ -200,4 +214,4 @@ jobs:
         if: always() && github.ref_name == 'develop'
         run: |
           [ -f ~/.ssh/config ] || { echo "never connected to the server; nothing to tear down"; exit 0; }
-          ssh server "cd /opt/$STACK && docker compose -p $STACK -f compose.yaml down -v --remove-orphans --timeout 10 2>&1 | tail -n 3; rm -f .env .env.next .env.prev .image; echo 'left in /opt/$STACK:' \$(ls)"
+          ssh server "cd /opt/$STACK && docker compose -p $STACK -f compose.yaml down -v --remove-orphans --timeout 10 2>&1 | tail -n 3; rm -f .env .env.next .env.prev db.env .image; echo 'left in /opt/$STACK:' \$(ls)"

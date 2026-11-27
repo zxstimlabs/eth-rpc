@@ -14,6 +14,11 @@
 # /health. If the new version isn't healthy within 30s it rolls back to
 # the previous image and .env, and exits non-zero (the workflow fails).
 #
+# The stack's Postgres password is generated here, once, into db.env. It
+# only has to match between the app and its own database, so it never
+# leaves the server (not even to GitHub). Production must keep db.env:
+# the data volume was initialised with that password.
+#
 # Safe to keep in the public repo: it holds no secrets. Secrets reach the
 # server only at deploy time (.env.next over SSH; registry token on stdin,
 # never argv, held only in RAM). Its output lands in public workflow logs, so it never prints
@@ -61,6 +66,16 @@ fi
 unset token
 
 [ -s .env.next ] || { echo "deploy: missing .env.next" >&2; exit 1; }
+
+if [ ! -s db.env ]; then
+  pw=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+  (
+    umask 077
+    printf 'POSTGRES_PASSWORD=%s\nDATABASE_URL=postgres://zxstim:%s@postgres:5432/zxstim_rpc\n' "$pw" "$pw" > db.env
+  )
+  unset pw
+  echo "deploy: generated a Postgres password for $stack (db.env, mode 600)"
+fi
 prev_image=$(cat .image 2>/dev/null || true)
 [ -f .env ] && cp -p .env .env.prev
 mv .env.next .env

@@ -8,10 +8,15 @@
  *   mainnets: `/rpc/ethereum`, `/rpc/arbitrum`, `/rpc/base`
  *   testnets: `/rpc/sepolia`, `/rpc/arbitrum-sepolia`, `/rpc/base-sepolia`
  *
- * This file is the Elysia "controller" for the feature: it wires together
- * CORS, per-client rate limiting, and the RpcService (which does the actual
- * request forwarding). The Elysia instance is exported so the root app can
- * mount it via `.use(rpc)`.
+ * Two Elysia instances share the `/rpc` prefix:
+ *
+ *   `rpc`       `/rpc/{chain}`        keyless; per-IP rate limit only
+ *   `rpcKeyed`  `/rpc/{chain}/{key}`  billed: 1 credit per JSON-RPC call
+ *                                     (see lib/billing), its own per-IP limit
+ *
+ * The key sits in the path, not a header, because a wallet's "custom RPC"
+ * setting takes only a URL. nginx keeps no access log, so it isn't written
+ * anywhere. Both are exported so the root app can mount them.
  */
 
 import { Elysia } from "elysia";
@@ -27,6 +32,15 @@ import {
   RateLimiterUnavailableError,
   RedisRateLimitContext,
 } from "../../lib/redis-rate-limit";
+import {
+  BillingUnavailableError,
+  InsufficientCreditsError,
+  accountStore,
+  countCalls,
+  leaseStore,
+} from "../../lib/billing";
+import { keyHashOf, parseHex32 } from "../../lib/keccak";
+import { billingConfig } from "../../config/billing";
 import { rpcConfig } from "../../config/rpc";
 import { RpcService } from "./service";
 
@@ -34,12 +48,12 @@ import { RpcService } from "./service";
 
 /**
  * Upstream JSON-RPC endpoints, one per supported chain. Read once at
- * module load from `.env.local` (Bun auto-loads it). The process refuses
- * to start without any of them — failing fast here is better than
- * returning 500s at runtime when a particular chain's path is hit.
+ * module load. The process refuses to start without any of them — failing
+ * fast here is better than returning 500s at runtime when a particular
+ * chain's path is hit.
  *
- * When you add a new chain: add a `requireEnv` line here and a matching
- * `.all("/{chain}", ...)` route below.
+ * When you add a new chain: add a line here (path → env var). Both the
+ * keyless and the billed route pick it up.
  */
 const requireEnv = (name: string): string => {
   const value = process.env[name];
@@ -49,15 +63,19 @@ const requireEnv = (name: string): string => {
   return value;
 };
 
-// Mainnets
-const ETHEREUM_RPC_URL = requireEnv("ETHEREUM_RPC_URL");
-const ARBITRUM_RPC_URL = requireEnv("ARBITRUM_RPC_URL");
-const BASE_RPC_URL = requireEnv("BASE_RPC_URL");
+// A Map, so names every object has (`toString`, `__proto__`) aren't chains.
+const UPSTREAMS: ReadonlyMap<string, string> = new Map([
+  // Mainnets
+  ["ethereum", requireEnv("ETHEREUM_RPC_URL")],
+  ["arbitrum", requireEnv("ARBITRUM_RPC_URL")],
+  ["base", requireEnv("BASE_RPC_URL")],
+  // Testnets (Sepolia-based)
+  ["sepolia", requireEnv("SEPOLIA_RPC_URL")],
+  ["arbitrum-sepolia", requireEnv("ARBITRUM_SEPOLIA_RPC_URL")],
+  ["base-sepolia", requireEnv("BASE_SEPOLIA_RPC_URL")],
+]);
 
-// Testnets (Sepolia-based)
-const SEPOLIA_RPC_URL = requireEnv("SEPOLIA_RPC_URL");
-const ARBITRUM_SEPOLIA_RPC_URL = requireEnv("ARBITRUM_SEPOLIA_RPC_URL");
-const BASE_SEPOLIA_RPC_URL = requireEnv("BASE_SEPOLIA_RPC_URL");
+const upstreamFor = (chain: string): string | undefined => UPSTREAMS.get(chain);
 
 /**
  * `TRUST_PROXY=1` → take the client IP from `X-Real-IP` (set by our nginx).
@@ -65,6 +83,27 @@ const BASE_SEPOLIA_RPC_URL = requireEnv("BASE_SEPOLIA_RPC_URL");
  * `clientIp()`. deploy/compose.yaml sets it; the port is bound to 127.0.0.1.
  */
 const TRUST_PROXY = process.env.TRUST_PROXY === "1";
+
+/**
+ * Rate-limit key: a salted hash of the client IP, never the raw IP.
+ * Replaces the plugin's default, which (a) keys on the raw IP and (b)
+ * `console.warn`s when IP detection fails (we want zero logs). Behind
+ * nginx + Docker the TCP peer is the proxy, so with TRUST_PROXY the
+ * nginx-set `X-Real-IP` is used instead (see clientIp). Empty string still
+ * works as a key: all unidentifiable clients share one bucket, which is
+ * safe (they self-throttle together).
+ */
+const clientKey = (request: Request, server: Parameters<typeof clientIp>[1]) => {
+  const ip = clientIp(request, server, TRUST_PROXY);
+  return ip ? hashClientIp(ip) : "";
+};
+
+/** A JSON-RPC-shaped error response (wallets show `error.message`). */
+const rpcError = (status: number, code: number, message: string) =>
+  new Response(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code, message } }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
 
 /**
  * Rate-limit counts live in Redis (shared `redis` client). Fails closed:
@@ -76,7 +115,12 @@ export const rpcRateLimitStore = new RedisRateLimitContext(redis, {
   timeoutMs: rpcConfig.rateLimit.redisTimeoutMs,
 });
 
-// --- Controller ------------------------------------------------------------
+export const rpcKeyedRateLimitStore = new RedisRateLimitContext(redis, {
+  prefix: rpcConfig.keyedRateLimit.redisKeyPrefix,
+  timeoutMs: rpcConfig.rateLimit.redisTimeoutMs,
+});
+
+// --- Keyless controller ----------------------------------------------------
 
 export const rpc = new Elysia({ prefix: "/rpc" })
   // CORS must be registered BEFORE rateLimit. The cors plugin answers
@@ -113,18 +157,7 @@ export const rpc = new Elysia({ prefix: "/rpc" })
       // bucket for everyone. src/index.ts registers the real server.
       injectServer: getListeningServer,
 
-      // Custom key generator. Replaces the plugin's default, which:
-      //   (a) uses the raw IP as the key (we don't want IPs stored), and
-      //   (b) emits `console.warn` when IP detection fails (we want zero logs).
-      //
-      // Behind nginx + Docker the TCP peer is the proxy, so with
-      // TRUST_PROXY the nginx-set `X-Real-IP` is used instead (see clientIp).
-      generator: (request, server) => {
-        const ip = clientIp(request, server, TRUST_PROXY);
-        // Empty string still works as a key: all unidentifiable clients
-        // share one bucket, which is safe (they self-throttle together).
-        return ip ? hashClientIp(ip) : "";
-      },
+      generator: clientKey,
     })
   )
   // Fail closed: when the limiter can't reach Redis, refuse with a 503
@@ -145,19 +178,84 @@ export const rpc = new Elysia({ prefix: "/rpc" })
   // behaviour. Final paths are `/rpc/{chain}` (prefix + route).
   //
   // All chains (mainnet and testnet) share the one rate-limit budget above.
-  .all("/ethereum", ({ request }) =>
-    RpcService.proxy(request, ETHEREUM_RPC_URL)
+  .all("/:chain", ({ params, request }) => {
+    const upstream = upstreamFor(params.chain);
+    if (!upstream) return rpcError(404, -32601, "unknown chain");
+    return RpcService.proxy(request, upstream);
+  });
+
+// --- Billed controller -----------------------------------------------------
+
+export const rpcKeyed = new Elysia({ prefix: "/rpc" })
+  // Same ordering rule as above. Browsers may read the balance header.
+  .use(cors({ origin: true, credentials: false, exposeHeaders: ["x-credits-remaining"] }))
+  .use(
+    rateLimit({
+      max: rpcConfig.keyedRateLimit.max,
+      duration: rpcConfig.keyedRateLimit.durationMs,
+      scoping: "scoped",
+      countFailedRequest: true,
+      context: rpcKeyedRateLimitStore,
+      injectServer: getListeningServer,
+      // Per IP, not per key: a per-key bucket would let anyone mint fresh
+      // random keys for fresh buckets. Credits already meter each key.
+      generator: clientKey,
+    })
   )
-  .all("/arbitrum", ({ request }) =>
-    RpcService.proxy(request, ARBITRUM_RPC_URL)
-  )
-  .all("/base", ({ request }) => RpcService.proxy(request, BASE_RPC_URL))
-  .all("/sepolia", ({ request }) =>
-    RpcService.proxy(request, SEPOLIA_RPC_URL)
-  )
-  .all("/arbitrum-sepolia", ({ request }) =>
-    RpcService.proxy(request, ARBITRUM_SEPOLIA_RPC_URL)
-  )
-  .all("/base-sepolia", ({ request }) =>
-    RpcService.proxy(request, BASE_SEPOLIA_RPC_URL)
-  );
+  .onError(({ error, set }) => {
+    if (error instanceof RateLimiterUnavailableError || error instanceof BillingUnavailableError) {
+      set.status = 503;
+      set.headers["retry-after"] = String(billingConfig.unavailableRetryAfterSec);
+      set.headers["content-type"] = "application/json";
+      return JSON.stringify({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32003, message: "temporarily unavailable" },
+      });
+    }
+    if (error instanceof InsufficientCreditsError) {
+      set.status = 402;
+      set.headers["content-type"] = "application/json";
+      return JSON.stringify({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32002, message: "out of credits" },
+      });
+    }
+  })
+  .all("/:chain/:key", async ({ params, request }) => {
+    const upstream = upstreamFor(params.chain);
+    if (!upstream) return rpcError(404, -32601, "unknown chain");
+
+    const key = parseHex32(params.key);
+    if (!key) return rpcError(401, -32001, "invalid api key");
+    // Billing counts calls in the body, so it must be a JSON-RPC POST.
+    if (request.method !== "POST") return rpcError(405, -32600, "use POST");
+
+    const accountId = await accountStore.resolveKey(keyHashOf(key));
+    if (!accountId) return rpcError(401, -32001, "unknown api key");
+
+    const body = await request.arrayBuffer();
+    const counted = countCalls(new TextDecoder().decode(body), billingConfig.calls);
+    if (!counted.ok) return rpcError(400, counted.code, counted.message);
+
+    // Throws InsufficientCreditsError (402) / BillingUnavailableError (503).
+    const spent = await leaseStore.spend(accountId, counted.calls);
+
+    let response: Response;
+    try {
+      response = await RpcService.proxy(request, upstream, body);
+    } catch {
+      await leaseStore.refund(accountId, counted.calls).catch(() => {});
+      return rpcError(502, -32003, "upstream unavailable");
+    }
+    // Charge only when the upstream did the work (JSON-RPC errors like
+    // `execution reverted` arrive as 200 and are charged).
+    let refunded = 0;
+    if (response.status >= 500 || response.status === 429) {
+      await leaseStore.refund(accountId, counted.calls).catch(() => {});
+      refunded = counted.calls;
+    }
+    response.headers.set("x-credits-remaining", String(spent.lease + spent.balance + refunded));
+    return response;
+  });

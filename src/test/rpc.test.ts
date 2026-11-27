@@ -226,6 +226,25 @@ describe("chain routing", () => {
     expect(res.status).toBe(200);
     expect(upstreamUrl).toBe(process.env[envVar]!);
   });
+
+  test("an unknown chain is a 404 and never reaches an upstream", async () => {
+    const res = await rpc.handle(
+      new Request("http://localhost/rpc/dogecoin", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      })
+    );
+    expect(res.status).toBe(404);
+    expect(upstreamUrl).toBeNull();
+  });
+
+  test("names that exist on every object (e.g. toString) aren't chains", async () => {
+    const res = await rpc.handle(
+      new Request("http://localhost/rpc/toString", { method: "POST", body: "{}" })
+    );
+    expect(res.status).toBe(404);
+  });
 });
 
 describe("rate limiting (Redis-backed)", () => {

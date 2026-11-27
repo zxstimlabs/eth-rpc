@@ -38,4 +38,15 @@ export const rpcConfig = {
     /** `Retry-After` (seconds) sent with the 503 when Redis is unavailable. */
     unavailableRetryAfterSec: 5,
   },
+
+  /**
+   * Per-client (IP) limit on billed `/rpc/{chain}/{key}` routes. Higher than
+   * the keyless budget (every call is paid for); still per IP rather than
+   * per key, so minting random keys can't buy fresh buckets.
+   */
+  keyedRateLimit: {
+    max: 1_200,
+    durationMs: 60_000,
+    redisKeyPrefix: "zxstim-rpc:rl:keyed:",
+  },
 };

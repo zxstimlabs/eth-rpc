@@ -1,19 +1,23 @@
-# zxstim-rpc: the app plus its private Redis (rate-limit counters).
+# zxstim-rpc: the app, its private Redis (rate-limit counters, credit
+# leases) and its private Postgres (credit balances, API key hashes,
+# recorded payments).
 #
 #   Run a published image:  IMAGE=ghcr.io/zxstimlabs/eth-rpc:<tag> docker compose -f deploy/compose.yaml up -d
 #   Build from this checkout: docker compose -f deploy/compose.yaml up -d --build
 #   Second copy side by side: add `-p <other-name>` and HOST_PORT=<other-port>
 #
 # Secrets (*_RPC_URL) come from deploy/.env (gitignored, mode 600), never
-# from the image.
+# from the image. The Postgres password lives in deploy/db.env, which
+# deploy.sh generates on the server once per stack; it never leaves the box.
 
 name: zxstim-rpc
 
 services:
   redis:
-    image: redis:8-alpine
-    # Counters only: memory, never disk. Bounded, and evicts keys closest
-    # to expiry first if it ever fills.
+    image: redis:8.12-alpine
+    # Memory only, never disk. Rate-limit counters and the key cache expire
+    # (and are evicted first if it ever fills); credit leases don't expire,
+    # so they're never evicted — a full Redis refuses writes (503) instead.
     command:
       - redis-server
       - --save
@@ -33,12 +37,49 @@ services:
     # No `ports:` — only reachable from this stack's network.
     networks: [backend]
 
+  postgres:
+    image: postgres:19-alpine
+    environment:
+      POSTGRES_USER: zxstim
+      POSTGRES_DB: zxstim_rpc
+    env_file: [db.env] # POSTGRES_PASSWORD (+ DATABASE_URL, used by the app)
+    # Same no-logs posture as nginx and the app: never write query text
+    # (which could carry parameters) to the log, and keep routine chatter
+    # (checkpoints, autovacuum, NOTICEs to clients) out.
+    command:
+      - postgres
+      - -c
+      - log_min_error_statement=panic
+      - -c
+      - log_checkpoints=off
+      - -c
+      - log_autovacuum_min_duration=-1
+      - -c
+      - client_min_messages=warning
+    volumes:
+      # Postgres 18+ images keep data under /var/lib/postgresql/<major>/docker.
+      - pgdata:/var/lib/postgresql
+    shm_size: 128mb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zxstim -d zxstim_rpc"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
+    # No `ports:` — only the app can reach it.
+    networks: [backend]
+
   app:
     image: ${IMAGE:-zxstim-rpc:local}
     build:
       context: ..
       target: runtime
-    env_file: [.env]
+    env_file: [.env, db.env]
     environment:
       REDIS_URL: redis://redis:6379
       # Client IP comes from nginx's X-Real-IP. Safe only because the port
@@ -49,6 +90,8 @@ services:
       - "127.0.0.1:${HOST_PORT:-8001}:8000"
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     restart: unless-stopped
     read_only: true
@@ -63,3 +106,6 @@ services:
 
 networks:
   backend: {}
+
+volumes:
+  pgdata: {}

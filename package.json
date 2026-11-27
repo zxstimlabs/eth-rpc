@@ -4,16 +4,20 @@
   "scripts": {
     "test": "bun --env-file=.env.local test",
     "dev": "bun run --watch src/index.ts",
-    "build": "bun build --compile --minify-whitespace --minify-syntax --target bun --outfile ./build/zxstim-rpc src/index.ts"
+    "build": "bun build --compile --minify-whitespace --minify-syntax --target bun --outfile ./build/zxstim-rpc src/index.ts",
+    "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
     "@elysia/openapi": "^1.4.15",
     "@elysiajs/cors": "^1.4.1",
+    "@noble/hashes": "2.4.0",
+    "drizzle-orm": "0.45.4",
     "elysia": "latest",
     "elysia-rate-limit": "^4.6.0"
   },
   "devDependencies": {
-    "bun-types": "latest"
+    "bun-types": "latest",
+    "drizzle-kit": "0.31.11"
   },
   "module": "src/index.js"
 }
